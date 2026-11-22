@@ -181,37 +181,303 @@ function ipQuadFromMask(mask, w, h, weight) {
   return null;
 }
 
+// ----------------------------- Page detection ------------------------------
+// Candidates come from straight edges (a Hough transform guided by gradient
+// direction) and from bright / background-difference masks. Every candidate is
+// scored by colour contrast across its four sides, so the page outline wins
+// over text rows, table rules and shadows.
+
+function ipPlanes(img) {
+  var w = img.width, h = img.height, n = w * h, d = img.data, r = new Float32Array(n), g = new Float32Array(n), b = new Float32Array(n);
+  for (var i = 0; i < n; i++) { r[i] = d[i * 4]; g[i] = d[i * 4 + 1]; b[i] = d[i * 4 + 2]; }
+  return { r: ipBoxBlur(r, w, h, 1), g: ipBoxBlur(g, w, h, 1), b: ipBoxBlur(b, w, h, 1), w: w, h: h };
+}
+
+// Mean contrast across a side a->b (quad is clockwise, so the inside is on the right).
+function ipSideScore(P, ax, ay, bx, by, off) {
+  var dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy);
+  if (L < 2) return 0;
+  var nx = -dy / L, ny = dx / L, N = 28, s = 0, cnt = 0, w = P.w, h = P.h, vert = Math.abs(dy) > Math.abs(dx) * 1.5;
+  for (var k = 0; k < N; k++) {
+    var t = 0.05 + 0.9 * (k + 0.5) / N, px = ax + dx * t, py = ay + dy * t;
+    // Compare wide bands on each side: thin rules and rows of text average out,
+    // while a real page edge separates paper from background.
+    var ox = px - nx * off * 0.85, oy = py - ny * off * 0.85;
+    if (ox < 0 || oy < 0 || ox > w - 1 || oy > h - 1) { s += P.border || 0.55; cnt++; continue; }
+    var ir = 0, ig = 0, ib = 0, orr = 0, og = 0, ob = 0, ni = 0, no = 0;
+    for (var m = 1, mEnd = P.narrow ? 2 : 5; m <= mEnd; m++) {
+      var f = off * 0.85 * m;
+      var ax2 = Math.round(px + nx * f), ay2 = Math.round(py + ny * f), cx3 = Math.round(px - nx * f), cy3 = Math.round(py - ny * f);
+      if (ax2 >= 0 && ay2 >= 0 && ax2 < w && ay2 < h) { var a = ay2 * w + ax2; ir += P.r[a]; ig += P.g[a]; ib += P.b[a]; ni++; }
+      if (cx3 >= 0 && cy3 >= 0 && cx3 < w && cy3 < h) { var c = cy3 * w + cx3; orr += P.r[c]; og += P.g[c]; ob += P.b[c]; no++; }
+    }
+    if (ni < (P.narrow ? 1 : 2) || no < 1) continue;
+    var dr = ir / ni - orr / no, dg = ig / ni - og / no, db = ib / ni - ob / no;
+    var con = Math.min(1, Math.sqrt(dr * dr + dg * dg + db * db) / (P.cap || 70));
+    var sv = con;
+    // A book's gutter is a wide, soft dark crease rather than a step. Credit it on
+    // near-vertical sides only, where text rows can't imitate it.
+    if (vert && sv < 0.8) {
+      var I0 = 0, I4 = 0, I10 = 0, okv = true;
+      for (var v = -1; v <= 1 && okv; v++) {
+        var c0x = Math.round(px + nx * v), c0y = Math.round(py + ny * v);
+        if (c0x < 0 || c0y < 0 || c0x > w - 1 || c0y > h - 1) { okv = false; break; }
+        var c0 = c0y * w + c0x; I0 += (P.r[c0] + P.g[c0] + P.b[c0]) / 9;
+      }
+      for (var sgn = -1; sgn <= 1 && okv; sgn += 2) {
+        var a4x = Math.round(px + nx * 4 * sgn), a4y = Math.round(py + ny * 4 * sgn), a10x = Math.round(px + nx * 11 * sgn), a10y = Math.round(py + ny * 11 * sgn);
+        if (a10x < 0 || a10y < 0 || a10x > w - 1 || a10y > h - 1) { okv = false; break; }
+        var i4 = a4y * w + a4x, i10 = a10y * w + a10x;
+        I4 += (P.r[i4] + P.g[i4] + P.b[i4]) / 6; I10 += (P.r[i10] + P.g[i10] + P.b[i10]) / 6;
+      }
+      if (okv) {
+        var depth = I10 - I0;
+        if (depth > 16 && (I10 - I4) > 0.3 * depth) sv = Math.max(sv, 0.95 * Math.min(1, depth / 40));
+      }
+    }
+    s += sv; cnt++;
+  }
+  return cnt > N / 3 ? s / cnt : 0;
+}
+
+// Quad = [[x,y] x4] clockwise from top-left. Returns null if implausible for a page.
+function ipQuadGeom(q, w, h) {
+  var i, mw = w * 0.04, mh = h * 0.04, minSide = Math.min(w, h) * 0.2;
+  for (i = 0; i < 4; i++) if (!(q[i][0] >= -mw && q[i][0] <= w - 1 + mw && q[i][1] >= -mh && q[i][1] <= h - 1 + mh)) return null;
+  var area = 0;
+  for (i = 0; i < 4; i++) {
+    var a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4];
+    area += a[0] * b[1] - b[0] * a[1];
+    if (Math.hypot(b[0] - a[0], b[1] - a[1]) < minSide) return null;
+    var ux = a[0] - b[0], uy = a[1] - b[1], vx = c[0] - b[0], vy = c[1] - b[1];
+    var cr = ux * vy - uy * vx;
+    if (cr > 0) return null; // not convex / not clockwise
+    var ang = Math.acos(Math.max(-1, Math.min(1, (ux * vx + uy * vy) / (Math.hypot(ux, uy) * Math.hypot(vx, vy))))) * 180 / Math.PI;
+    if (ang < 42 || ang > 138) return null;
+  }
+  area /= 2;
+  if (area < 0.12 * w * h) return null;
+  // Opposite sides of a photographed page converge only a little.
+  for (i = 0; i < 2; i++) {
+    var p0 = q[i], p1 = q[i + 1], p2 = q[(i + 3) % 4], p3 = q[(i + 2) % 4];
+    var a1 = Math.atan2(p1[1] - p0[1], p1[0] - p0[0]), a2 = Math.atan2(p3[1] - p2[1], p3[0] - p2[0]);
+    var dA = Math.abs(a1 - a2) * 180 / Math.PI; if (dA > 180) dA = 360 - dA;
+    if (dA > 28) return null;
+  }
+  return area;
+}
+function ipQuadScore(P, q) {
+  var area = ipQuadGeom(q, P.w, P.h);
+  if (area == null) return -1;
+  var g = 1, border = 0;
+  for (var i = 0; i < 4; i++) {
+    var a = q[i], b = q[(i + 1) % 4], s = ipSideScore(P, a[0], a[1], b[0], b[1], 3.5);
+    if (Math.abs(s - (P.border || 0.55)) < 1e-9) border++;
+    g *= Math.max(0.02, s);
+  }
+  if (border === 4) return 0.3;
+  var af = P.areaW == null ? 0.3 : P.areaW;
+  return Math.pow(g, 0.25) * (1 - af + af * Math.min(1, area / (0.6 * P.w * P.h)));
+}
+
+function ipLineX(L, y) { return Math.abs(L.c) < 1e-6 ? NaN : (L.r - y * L.s) / L.c; }
+function ipLineY(L, x) { return Math.abs(L.s) < 1e-6 ? NaN : (L.r - x * L.c) / L.s; }
+function ipMeet(A, B) {
+  var det = A.c * B.s - A.s * B.c;
+  if (Math.abs(det) < 1e-6) return null;
+  return [(A.r * B.s - B.r * A.s) / det, (B.r * A.c - A.r * B.c) / det];
+}
+// Part of a line inside the image, as two points.
+function ipClipLine(L, w, h) {
+  var pts = [], x, y;
+  if (Math.abs(L.s) > 1e-6) { y = ipLineY(L, 0); if (y >= 0 && y <= h - 1) pts.push([0, y]); y = ipLineY(L, w - 1); if (y >= 0 && y <= h - 1) pts.push([w - 1, y]); }
+  if (Math.abs(L.c) > 1e-6) { x = ipLineX(L, 0); if (x >= 0 && x <= w - 1) pts.push([x, 0]); x = ipLineX(L, h - 1); if (x >= 0 && x <= w - 1) pts.push([x, h - 1]); }
+  if (pts.length < 2) return null;
+  var a = pts[0], b = pts[1], best = 0;
+  for (var i = 0; i < pts.length; i++) for (var j = i + 1; j < pts.length; j++) {
+    var d = Math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1]);
+    if (d > best) { best = d; a = pts[i]; b = pts[j]; }
+  }
+  return best > 4 ? [a, b] : null;
+}
+function ipMkLine(tDeg, r) { var t = tDeg * Math.PI / 180; return { t: tDeg, c: Math.cos(t), s: Math.sin(t), r: r }; }
+
+function ipHoughLines(P) {
+  var w = P.w, h = P.h, n = w * h, x, y, i;
+  var gxA = new Float32Array(n), gyA = new Float32Array(n), mag = new Float32Array(n), planes = [P.r, P.g, P.b], maxM = 0;
+  for (y = 1; y < h - 1; y++) for (x = 1; x < w - 1; x++) {
+    i = y * w + x; var best = -1, bgx = 0, bgy = 0;
+    for (var c = 0; c < 3; c++) {
+      var p = planes[c];
+      var gx = (p[i - w + 1] + 2 * p[i + 1] + p[i + w + 1]) - (p[i - w - 1] + 2 * p[i - 1] + p[i + w - 1]);
+      var gy = (p[i + w - 1] + 2 * p[i + w] + p[i + w + 1]) - (p[i - w - 1] + 2 * p[i - w] + p[i - w + 1]);
+      var m = gx * gx + gy * gy;
+      if (m > best) { best = m; bgx = gx; bgy = gy; }
+    }
+    gxA[i] = bgx; gyA[i] = bgy; mag[i] = Math.sqrt(best); if (mag[i] > maxM) maxM = mag[i];
+  }
+  P.gx = gxA; P.gy = gyA;
+  var hist = new Int32Array(256), sc = 255 / Math.max(1, maxM);
+  for (i = 0; i < n; i++) hist[Math.min(255, (mag[i] * sc) | 0)]++;
+  var acc0 = 0, cut = 255;
+  for (var k = 255; k >= 0; k--) { acc0 += hist[k]; if (acc0 > n * 0.22) { cut = k; break; } }
+  var thr = Math.max(14, cut / sc);
+  var diag = Math.ceil(Math.hypot(w, h)), nR = 2 * diag + 1, NT = 180, acc = new Float32Array(NT * nR);
+  var cs = new Float32Array(NT), sn = new Float32Array(NT);
+  for (var t = 0; t < NT; t++) { cs[t] = Math.cos(t * Math.PI / 180); sn[t] = Math.sin(t * Math.PI / 180); }
+  for (y = 1; y < h - 1; y++) for (x = 1; x < w - 1; x++) {
+    i = y * w + x; if (mag[i] < thr) continue;
+    var phi = Math.atan2(gyA[i], gxA[i]) * 180 / Math.PI, t0 = Math.round(((phi % 180) + 180) % 180);
+    for (var dt = -4; dt <= 4; dt++) {
+      var tt = (t0 + dt + 360) % 180, rr = Math.round(x * cs[tt] + y * sn[tt]) + diag;
+      acc[tt * nR + rr] += 1;
+    }
+  }
+  var minV = 0.14 * Math.min(w, h), peaks = [];
+  for (t = 0; t < NT; t++) for (var r = 3; r < nR - 3; r++) {
+    var v = acc[t * nR + r]; if (v < minV) continue;
+    var isMax = true;
+    for (var a2 = -2; a2 <= 2 && isMax; a2++) for (var b2 = -3; b2 <= 3; b2++) {
+      if (!a2 && !b2) continue;
+      var t2 = (t + a2 + NT) % NT;
+      if (acc[t2 * nR + r + b2] > v) { isMax = false; break; }
+    }
+    if (isMax) peaks.push({ t: t, r: r - diag, v: v });
+  }
+  peaks.sort(function (p1, p2) { return p2.v - p1.v; });
+  var kept = [];
+  for (i = 0; i < peaks.length && kept.length < 28; i++) {
+    var pk = peaks[i], dup = false;
+    for (var j = 0; j < kept.length && !dup; j++) {
+      var q = kept[j], d1 = Math.abs(q.t - pk.t), rr2 = pk.r;
+      if (d1 > 90) { d1 = 180 - d1; rr2 = -pk.r; }
+      if (d1 < 7 && Math.abs(q.r - rr2) < 12) dup = true;
+    }
+    if (!dup) kept.push(pk);
+  }
+  return kept.map(function (pk) { return ipMkLine(pk.t, pk.r); });
+}
+
+// Near-vertical soft dark creases (a book's gutter), found with a small Hough
+// transform over a "valley" map instead of gradients.
+function ipGutterLines(P) {
+  var w = P.w, h = P.h, x, y, i, R = 9, vm = new Float32Array(w * h), lum = new Float32Array(w * h);
+  for (i = 0; i < w * h; i++) lum[i] = (P.r[i] + P.g[i] + P.b[i]) / 3;
+  for (y = 0; y < h; y++) for (x = R; x < w - R; x++) {
+    i = y * w + x;
+    var l = lum[i - R], r = lum[i + R], c = lum[i], l4 = lum[i - 4], r4v = lum[i + 4];
+    var depth = Math.min(l, r) - c;
+    if (depth > 14 && Math.min(l, r) - Math.min(l4, r4v) > 0.3 * depth) vm[i] = depth;
+  }
+  var diag = Math.ceil(Math.hypot(w, h)), nR = 2 * diag + 1, T0 = -20, NT = 41, acc = new Float32Array(NT * nR);
+  for (y = 0; y < h; y++) for (x = 0; x < w; x++) {
+    if (!vm[y * w + x]) continue;
+    for (var k = 0; k < NT; k++) {
+      var t = (T0 + k) * Math.PI / 180, rr = Math.round(x * Math.cos(t) + y * Math.sin(t)) + diag;
+      acc[k * nR + rr] += 1;
+    }
+  }
+  var found = [];
+  for (var n2 = 0; n2 < 3; n2++) {
+    var best = 0, bk = -1, br = -1;
+    for (i = 0; i < acc.length; i++) if (acc[i] > best) { best = acc[i]; bk = (i / nR) | 0; br = i % nR; }
+    if (best < 0.3 * h) break;
+    var tdeg = T0 + bk;
+    found.push(ipMkLine((tdeg + 180) % 180, tdeg < 0 ? -(br - diag) : br - diag));
+    for (var dk = -6; dk <= 6; dk++) for (var dr = -10; dr <= 10; dr++) {
+      var kk = bk + dk, r2 = br + dr; if (kk >= 0 && kk < NT && r2 >= 0 && r2 < nR) acc[kk * nR + r2] = 0;
+    }
+  }
+  return found;
+}
+
+// Nudge each side along its normal to sit exactly on the strongest contrast.
+function ipRefineQuad(P, q) {
+  var lines = [], i;
+  P.narrow = true;
+  for (i = 0; i < 4; i++) {
+    var a = q[i], b = q[(i + 1) % 4], dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1;
+    var nx = -dy / L, ny = dx / L, best = -1, ba = 0, bb = 0;
+    for (var da = -5; da <= 5; da++) for (var db = -5; db <= 5; db++) {
+      var s = ipSideScore(P, a[0] + nx * da, a[1] + ny * da, b[0] + nx * db, b[1] + ny * db, 1.8) - 0.002 * (Math.abs(da) + Math.abs(db));
+      if (s > best) { best = s; ba = da; bb = db; }
+    }
+    lines.push([[a[0] + nx * ba, a[1] + ny * ba], [b[0] + nx * bb, b[1] + ny * bb]]);
+  }
+  P.narrow = false;
+  var out = [];
+  for (i = 0; i < 4; i++) {
+    var L1 = lines[(i + 3) % 4], L2 = lines[i];
+    var x1 = L1[0][0], y1 = L1[0][1], x2 = L1[1][0], y2 = L1[1][1], x3 = L2[0][0], y3 = L2[0][1], x4 = L2[1][0], y4 = L2[1][1];
+    var den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if (Math.abs(den) < 1e-6) { P.narrow = false; return q; }
+    var px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / den;
+    var py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / den;
+    out.push([px, py]);
+  }
+  return ipQuadScore(P, out) >= ipQuadScore(P, q) - 0.03 ? out : q;
+}
+
 // Find the document outline. Returns normalized [x0,y0,...,x3,y3] (TL,TR,BR,BL) or null.
 function ipDetectQuad(src) {
-  var img = ipResize(src, 360), w = img.width, h = img.height, n = w * h, d = img.data, i, j;
-  // Candidate 1: paper is bright and unsaturated.
+  var img = ipResize(src, 400), w = img.width, h = img.height, n = w * h, d = img.data, i, j;
+  var P = ipPlanes(img), cands = [];
+  // 1) Straight edges, plus the frame edges for pages that run off the photo.
+  var lines = ipHoughLines(P), H = [], V = [];
+  // Rank lines by how much they look like a page edge across their visible length.
+  for (i = 0; i < lines.length; i++) {
+    var Li = lines[i], seg = ipClipLine(Li, w, h);
+    Li.q = seg ? ipSideScore(P, seg[0][0], seg[0][1], seg[1][0], seg[1][1], 3.5) : 0;
+    (Li.t >= 45 && Li.t < 135 ? H : V).push(Li);
+  }
+  // Keep the strongest lines by votes, plus the best-looking edges by contrast.
+  var pick = function (arr) {
+    var out = arr.slice(0, 8), rest = arr.slice(8).sort(function (l1, l2) { return l2.q - l1.q; });
+    return out.concat(rest.slice(0, 4));
+  };
+  H = pick(H).concat([ipMkLine(90, 0), ipMkLine(90, h - 1)]);
+  V = pick(V).concat(ipGutterLines(P), [ipMkLine(0, 0), ipMkLine(0, w - 1)]);
+  for (var a = 0; a < H.length; a++) for (var b = a + 1; b < H.length; b++) {
+    var ya = ipLineY(H[a], w / 2), yb = ipLineY(H[b], w / 2);
+    if (!(Math.abs(ya - yb) > 0.25 * h)) continue;
+    var top = ya < yb ? H[a] : H[b], bot = ya < yb ? H[b] : H[a];
+    for (var c = 0; c < V.length; c++) for (var e = c + 1; e < V.length; e++) {
+      var xc = ipLineX(V[c], h / 2), xe = ipLineX(V[e], h / 2);
+      if (!(Math.abs(xc - xe) > 0.25 * w)) continue;
+      var lft = xc < xe ? V[c] : V[e], rgt = xc < xe ? V[e] : V[c];
+      var q = [ipMeet(top, lft), ipMeet(top, rgt), ipMeet(bot, rgt), ipMeet(bot, lft)];
+      if (q[0] && q[1] && q[2] && q[3]) cands.push(q);
+    }
+  }
+  // 2) Region masks: bright paper, colour different from the surroundings, dark paper.
   var f = new Float32Array(n);
   for (i = 0; i < n; i++) {
-    j = i * 4; var r = d[j], g = d[j + 1], b = d[j + 2];
-    var mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-    f[i] = 0.299 * r + 0.587 * g + 0.114 * b - 0.6 * (mx - mn);
+    j = i * 4; var r0 = d[j], g0 = d[j + 1], b0 = d[j + 2];
+    f[i] = 0.299 * r0 + 0.587 * g0 + 0.114 * b0 - 0.6 * (Math.max(r0, g0, b0) - Math.min(r0, g0, b0));
   }
-  var bl = ipBoxBlur(f, w, h, 2), thr = ipOtsu(bl, n);
-  var bright = new Float32Array(n), dark = new Float32Array(n);
+  var bl = ipBoxBlur(f, w, h, 2), thr = ipOtsu(bl, n), bright = new Float32Array(n), dark = new Float32Array(n);
   for (i = 0; i < n; i++) { bright[i] = bl[i] > thr ? 1 : 0; dark[i] = 1 - bright[i]; }
-  // Candidate 2: anything that differs from the colour of the surface around the frame edge.
   var ring = Math.max(2, Math.round(Math.min(w, h) * 0.03)), rs = [], gs = [], bs = [];
   for (var y = 0; y < h; y++) for (var x = 0; x < w; x++) {
     if (x >= ring && x < w - ring && y >= ring && y < h - ring) continue;
     j = (y * w + x) * 4; rs.push(d[j]); gs.push(d[j + 1]); bs.push(d[j + 2]);
   }
-  function med(a) { a.sort(function (p, q) { return p - q; }); return a[a.length >> 1]; }
-  var br = med(rs), bgc = med(gs), bb = med(bs);
-  var dist = new Float32Array(n);
-  for (i = 0; i < n; i++) { j = i * 4; dist[i] = Math.min(255, Math.hypot(d[j] - br, d[j + 1] - bgc, d[j + 2] - bb)); }
+  function med(arr) { arr.sort(function (p1, p2) { return p1 - p2; }); return arr[arr.length >> 1]; }
+  var br = med(rs), bgc = med(gs), bb2 = med(bs), dist = new Float32Array(n);
+  for (i = 0; i < n; i++) { j = i * 4; dist[i] = Math.min(255, Math.hypot(d[j] - br, d[j + 1] - bgc, d[j + 2] - bb2)); }
   var dbl = ipBoxBlur(dist, w, h, 2), dthr = Math.max(28, ipOtsu(dbl, n)), diff = new Float32Array(n);
   for (i = 0; i < n; i++) diff[i] = dbl[i] > dthr ? 1 : 0;
-  var cands = [ipQuadFromMask(bright, w, h, 1), ipQuadFromMask(diff, w, h, 1), ipQuadFromMask(dark, w, h, 0.75)];
-  var best = null;
-  for (i = 0; i < cands.length; i++) if (cands[i] && (!best || cands[i].score > best.score)) best = cands[i];
-  if (!best) return null;
-  var oq = ipOrderQuad(best.quad), out = [];
-  for (i = 0; i < 4; i++) { out.push(Math.max(0, Math.min(1, oq[i][0] / w))); out.push(Math.max(0, Math.min(1, oq[i][1] / h))); }
+  [bright, diff, dark].forEach(function (m) {
+    var res = ipQuadFromMask(m, w, h, 1);
+    if (res) cands.push(ipOrderQuad(res.quad));
+  });
+  // 3) Score everything the same way, refine the winner.
+  var best = null, bestS = -1;
+  for (i = 0; i < cands.length; i++) { var sc = ipQuadScore(P, cands[i]); if (sc > bestS) { bestS = sc; best = cands[i]; } }
+  if (!best || bestS < 0.5) return null;
+  best = ipRefineQuad(P, best);
+  var out = [];
+  for (i = 0; i < 4; i++) { out.push(Math.max(0, Math.min(1, best[i][0] / (w - 1)))); out.push(Math.max(0, Math.min(1, best[i][1] / (h - 1)))); }
   return out;
 }
 
@@ -504,4 +770,4 @@ function ipPack1Bit(img) {
 }
 
 var IP_FUNCS = [ipNew, ipGray, ipBoxBlur, ipResize, ipOtsu, ipConvexHull, ipPolyArea, ipMaxQuad, ipOrderQuad,
-  ipQuadFromMask, ipDetectQuad, ipHomography, ipAspect, ipQuadSize, ipWarp, ipBackground, ipFilter, ipAdjust, ipRotate, ipProcess, ipInkCutout, ipPack1Bit];
+  ipQuadFromMask, ipPlanes, ipSideScore, ipQuadGeom, ipQuadScore, ipLineX, ipLineY, ipMeet, ipClipLine, ipMkLine, ipHoughLines, ipGutterLines, ipRefineQuad, ipDetectQuad, ipHomography, ipAspect, ipQuadSize, ipWarp, ipBackground, ipFilter, ipAdjust, ipRotate, ipProcess, ipInkCutout, ipPack1Bit];
