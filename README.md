@@ -12,6 +12,7 @@ A document scanner that runs entirely in the browser, with the features you'd us
 - **Export**: PDF (searchable text layer, AES-256 password protection, watermarks, A4/Letter/Legal/fit, margins, quality), JPG, PNG (multi-page as ZIP), Word (.docx), plain text, one long stitched image
 - **Import PDFs** (keeps their text), drag-and-drop and paste images
 - Folders, stars, sorting, light and dark themes
+- **Installable app** (Add to Home Screen) that works offline; text recognition data is saved for offline use the first time you use it
 
 Scans are stored in the browser (IndexedDB) on the device that made them. Nothing is uploaded unless you export it.
 
@@ -22,7 +23,7 @@ When the same page is opened as a Claude artifact, it also gets private cloud ba
 1. Push this repository to GitHub.
 2. In Vercel choose **Add New → Project**, import the repository, keep the framework preset as **Other** with no build command, and deploy.
 
-`vercel.json` adds caching for `lib/` and a few security headers.
+`vercel.json` adds caching for `lib/`, keeps `sw.js` and the manifest fresh, and sets a few security headers. If you change anything in `lib/`, bump `VERSION` in `sw.js` so installed copies pick it up.
 
 ## Develop
 

@@ -4,6 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Flatbed Scanner</title>
+<meta name="description" content="Scan documents with your camera, pull out the text, sign, and export PDFs. Works offline.">
+<meta name="theme-color" content="#eef0ec" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1113" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Flatbed">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&family=Schibsted+Grotesk:wght@600;700;800&display=swap">
@@ -96,7 +107,12 @@ h1, h2, h3 { font-family: var(--font-display); margin: 0; text-wrap: balance; le
 .quick button { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 2px 8px; border-radius: 14px; background: var(--sheet); border: 1px solid var(--rule); font-size: 12px; color: var(--ink); line-height: 1.15; text-align: center; }
 .quick button .ic { color: var(--accent); }
 .quick button:hover { border-color: var(--accent); }
-@media (max-width: 420px) { .quick { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .quick { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.install-card { display: flex; align-items: center; gap: 12px; margin-top: 14px; padding: 12px 12px 12px 14px; border-radius: var(--r); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); }
+.install-card img { width: 40px; height: 40px; border-radius: 10px; flex: none; }
+.install-card .grow { flex: 1; min-width: 0; }
+.install-card b { display: block; font-size: 15px; }
+.install-card small { display: block; color: var(--ink-2); font-size: 13px; }
 
 .chips { display: flex; gap: 8px; overflow-x: auto; padding: 12px 0 4px; scrollbar-width: none; }
 .chips::-webkit-scrollbar { display: none; }
@@ -1653,17 +1669,24 @@ const OCR = {
         langs.push({ code: c, data: b64ToBytes((await r.text()).trim()) });
       }
       if (onProgress) onProgress(0.15, 'Starting text recognition…');
-      this.worker = await window.Tesseract.createWorker(langs, 1, {
+      this.worker = await withTimeout(window.Tesseract.createWorker(langs, 1, {
         workerPath: absUrl('lib/tesseract/worker.min.js'),
         corePath: absUrl('lib/tesseract/'),
         cacheMethod: 'none',
         workerBlobURL: true,
         logger: (m) => { if (this.onLog) this.onLog(m); },
         errorHandler: (e) => console.warn('OCR worker', e),
-      });
+      }), 120000, 'OCR start timed out');
       this.lang = lang;
     })();
-    try { await this.loading; } finally { this.loading = null; }
+    try { await this.loading; }
+    catch (e) {
+      console.warn('OCR start failed', e);
+      this.worker = null; this.lang = null;
+      throw new Error(navigator.onLine === false
+        ? 'Text recognition needs an internet connection the first time you use it. Connect once, then it works offline.'
+        : 'Text recognition could not start. Check your connection and try again.');
+    } finally { this.loading = null; }
     return this.worker;
   },
   async recognize(blob, lang, onProgress) {
@@ -2285,6 +2308,7 @@ function viewHome() {
     </div></header>
     <div class="wrap">
       <label class="search">${ic('search')}<input id="q" type="search" placeholder="Search names and text in scans" value="${esc(S.query)}" aria-label="Search documents" enterkeyhint="search"></label>
+      ${installCardHTML()}
       <div class="quick">
         <button data-act="q-scan">${ic('camera')}<span>Scan</span></button>
         <button data-act="q-import">${ic('image')}<span>Import photos</span></button>
@@ -2429,6 +2453,7 @@ function viewSettings() {
       <div class="set-row"><div class="grow"><b>Margins</b></div>${selectHTML('margin', [['none', 'None'], ['small', 'Small · 6 mm'], ['wide', 'Wide · 15 mm']])}</div>
       <div class="set-row"><div class="grow"><b>Quality</b><small>Smaller files are easier to email</small></div>${selectHTML('quality', [['small', 'Small file'], ['standard', 'Standard'], ['high', 'High']])}</div>
     </div></section>
+    ${installRowHTML()}
     <section class="section"><h2 class="section-title">Appearance</h2><div class="card">
       <div class="set-row"><div class="grow"><b>Theme</b></div>${selectHTML('theme', [['system', 'Match device'], ['light', 'Light'], ['dark', 'Dark']])}</div>
     </div></section>
@@ -2489,6 +2514,43 @@ async function makeSampleDoc() {
   S.docs.push(doc);
   await Store.putDoc(doc);
 }
+
+// --------------------------- Install as an app ------------------------------
+const PWA = { evt: null, dismissed: false };
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+function installCardHTML() {
+  if (IN_CLAUDE || !PWA.evt || PWA.dismissed || isStandalone()) return '';
+  return `<div class="install-card" role="region" aria-label="Install the app"><img src="icon-192.png" alt=""><div class="grow"><b>Install Flatbed</b><small>Opens from your home screen and works offline</small></div>
+    <button class="btn btn-sm btn-primary" data-act="pwa-install">Install</button><button class="icon-btn" data-act="pwa-dismiss" aria-label="Not now">${ic('x')}</button></div>`;
+}
+function installRowHTML() {
+  if (IN_CLAUDE) return '';
+  let small, ctl = '';
+  if (isStandalone()) small = 'Installed on this device';
+  else if (PWA.evt) { small = 'Adds Flatbed to your home screen and works offline'; ctl = '<button class="btn btn-sm btn-primary" data-act="pwa-install">Install</button>'; }
+  else if (isIOS()) small = 'In Safari, tap Share, then Add to Home Screen';
+  else small = 'Use your browser menu: Install app or Add to Home screen';
+  return `<section class="section"><h2 class="section-title">App</h2><div class="card"><div class="set-row">${ic('download', 'lead')}<div class="grow"><b>Install Flatbed</b><small>${small}</small></div>${ctl}</div></div></section>`;
+}
+function setupPWA() {
+  if (IN_CLAUDE) return;
+  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); PWA.evt = e; if (S.tab === 'home' || S.tab === 'settings') refreshView(); });
+  window.addEventListener('appinstalled', () => { PWA.evt = null; toast('Flatbed is installed', { type: 'ok' }); refreshView(); });
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    const reg = () => navigator.serviceWorker.register('sw.js').catch((e) => console.warn('Service worker', e));
+    if (document.readyState === 'complete') reg(); else window.addEventListener('load', reg);
+  }
+}
+Object.assign(A, {
+  'pwa-install': async () => {
+    const e = PWA.evt; if (!e) return;
+    PWA.evt = null;
+    try { await e.prompt(); const r = await e.userChoice; if (r && r.outcome !== 'accepted') PWA.dismissed = true; } catch (err) { /* prompt already used */ }
+    refreshView();
+  },
+  'pwa-dismiss': () => { PWA.dismissed = true; refreshView(); },
+});
 
 // ---------------------------------------------------------------------------
 // Overlays (full-screen studio views) and the scan session:
@@ -4347,6 +4409,7 @@ async function boot() {
   }
   render();
   setupDropAndPaste();
+  setupPWA();
   getDownloads();
   Assist.init().catch(() => {});
   Cloud.init().catch(() => {});
