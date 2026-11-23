@@ -45,22 +45,47 @@ function insetQuad(q, f) {
   return q.map((v, i) => clamp(v + ((i % 2 ? cy : cx) - v) * f * 2.5, 0, 1));
 }
 async function makeItem(file, from) {
-  const c = await blobToCanvas(file, STORE_MAX);
-  const origBlob = from ? file : await canvasToBlob(c, 'image/jpeg', 0.9);
+  const img = await blobToImage(file);
+  const nw = img.naturalWidth, nh = img.naturalHeight;
+  const small = (dim) => {
+    const sc = Math.min(1, dim / Math.max(nw, nh)), c = makeCanvas(nw * sc, nh * sc), cx = c.getContext('2d');
+    cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+    cx.fillStyle = '#fff'; cx.fillRect(0, 0, c.width, c.height); cx.drawImage(img, 0, 0, c.width, c.height);
+    return c;
+  };
+  const det = small(480);
+  // The photo is kept exactly as the camera saved it. Only formats that other
+  // browsers may not open (HEIC and the like) are converted, at full resolution.
+  let origBlob = file;
+  if (!from && !/^image\/(jpe?g|png|webp)$/i.test(file.type || '')) origBlob = await canvasToBlob(await blobToCanvas(file, 99999, MAX_PIXELS), 'image/jpeg', PROC_JPEG);
   const item = {
-    id: uid(), origBlob, ow: c.width, oh: c.height,
-    disp: scaleCanvas(c, 1400), prev: getImageData(scaleCanvas(c, 1000)),
+    id: uid(), origBlob, ow: nw, oh: nh, thumbUrl: scaleCanvas(det, 120).toDataURL('image/jpeg', 0.7),
     quad: FULL_QUAD.slice(), detected: false, filter: S.settings.filter, adj: { b: 0, c: 0, s: 0 }, rot: 0,
   };
   if (from) {
     Object.assign(item, { origKey: from.orig, quad: (from.quad || FULL_QUAD).slice(), filter: from.filter || 'original', adj: { b: 0, c: 0, s: 0, ...(from.adj || {}) }, rot: from.rot || 0, kind: from.kind });
   } else if (S.settings.autoCrop) {
     try {
-      const q = await IP.run('detect', { img: getImageData(scaleCanvas(c, 480)) });
-      if (q && quadConvex(q)) { item.quad = insetQuad(q, 0.004); item.detected = true; }
+      const q = await IP.run('detect', { img: getImageData(det) });
+      if (q && quadConvex(q)) { item.quad = insetQuad(q, 0.007); item.detected = true; }
     } catch (e) { console.warn('detect failed', e); }
   }
   return item;
+}
+// Screen-sized copies are made only for the photo being edited, so long
+// batches don't run out of memory and previews stay sharp.
+async function ensureItemImages(it) {
+  if (it.disp) return;
+  if (!it.loading) {
+    it.loading = blobToCanvas(it.origBlob, 2000).then((c) => {
+      it.disp = c; it.prev = getImageData(scaleCanvas(c, 1400));
+    }).finally(() => { it.loading = null; });
+  }
+  await it.loading;
+}
+function releaseOtherItems() {
+  const s = Sess.s; if (!s) return;
+  s.items.forEach((x, i) => { if (i !== s.idx) { x.disp = null; x.prev = null; x.warped = null; x.chips = null; x.warpKey = null; } });
 }
 
 const Sess = {
@@ -109,6 +134,7 @@ function renderSess(o) {
   const s = Sess.s; if (!s) return;
   const it = s.items[s.idx];
   const crop = s.step === 'crop';
+  releaseOtherItems();
   makeStripThumbs();
   const canAdd = s.mode !== 'edit' && !(s.mode === 'id' && s.items.length >= 2);
   const side = s.mode === 'id' ? (s.idx === 0 ? 'Front side · ' : 'Back side · ') : '';
@@ -157,13 +183,18 @@ function renderSess(o) {
   }
 }
 function makeStripThumbs() {
-  for (const x of Sess.s.items) if (!x.thumbUrl) x.thumbUrl = scaleCanvas(x.disp, 120).toDataURL('image/jpeg', 0.7);
+  for (const x of Sess.s.items) if (!x.thumbUrl && x.disp) x.thumbUrl = scaleCanvas(x.disp, 120).toDataURL('image/jpeg', 0.7);
 }
 
 // ---------------------------- Crop corners ---------------------------------
 function setupCrop() {
   const s = Sess.s; if (!s) return;
   const it = s.items[s.idx], stage = $('#sess-stage'); if (!stage) return;
+  if (!it.disp) {
+    stage.innerHTML = '<div class="stage-msg">Opening photo…</div>';
+    ensureItemImages(it).then(() => { if (Sess.s && Sess.s.items[Sess.s.idx] === it && Sess.s.step === 'crop') setupCrop(); }).catch(handleErr);
+    return;
+  }
   stage.innerHTML = '';
   const r = stage.getBoundingClientRect(), pad = 24, img = it.disp, dpr = DPR();
   const sc = Math.min((r.width - pad * 2) / img.width, (r.height - pad * 2) / img.height);
@@ -248,7 +279,8 @@ function setupCrop() {
 async function ensureWarped(it) {
   const key = it.quad.join(',');
   if (it.warped && it.warpKey === key) return;
-  it.warped = await IP.run('process', { img: it.prev, quad: isFullQuad(it.quad) ? null : it.quad, maxDim: 1000 });
+  await ensureItemImages(it);
+  it.warped = await IP.run('process', { img: it.prev, quad: isFullQuad(it.quad) ? null : it.quad, maxDim: 1400 });
   it.warpKey = key; it.chips = null;
 }
 async function setupEnhance() {
@@ -292,30 +324,38 @@ async function drawPreview() {
 
 // ------------------------------- Saving ------------------------------------
 async function bookPages(it) {
-  const oc = await blobToCanvas(it.origBlob, STORE_MAX);
-  const warped = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(it.quad) ? null : it.quad, rot: it.rot, maxDim: STORE_MAX });
+  const oc = await blobToCanvas(it.origBlob, 99999, MAX_PIXELS);
+  const warped = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(it.quad) ? null : it.quad, rot: it.rot, maxDim: 99999, maxPx: MAX_PIXELS });
   const wc = imgDataToCanvas(warped), half = Math.round(wc.width / 2), out = [];
   for (const [x0, w] of [[0, half], [half, wc.width - half]]) {
     const c = makeCanvas(w, wc.height); c.getContext('2d').drawImage(wc, x0, 0, w, wc.height, 0, 0, w, wc.height);
-    out.push(await buildPage({ origBlob: await canvasToBlob(c, 'image/jpeg', 0.92), quad: FULL_QUAD, filter: it.filter, adj: it.adj, rot: 0 }));
+    out.push(await buildPage({ origBlob: await canvasToBlob(c, 'image/png'), quad: FULL_QUAD, filter: it.filter, adj: it.adj, rot: 0 }));
   }
   return out;
 }
 async function idCardPage(items) {
-  const W = 2480, H = 3508, c = makeCanvas(W, H), x = c.getContext('2d');
-  x.fillStyle = '#fff'; x.fillRect(0, 0, W, H);
-  let y = 460;
+  const procs = [];
   for (const it of items) {
-    const oc = await blobToCanvas(it.origBlob, STORE_MAX);
-    const r = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(it.quad) ? null : it.quad, filter: it.filter, adj: it.adj, rot: it.rot, maxDim: 1600 });
-    const p = imgDataToCanvas(r), ar = p.height / p.width;
-    // 85.6 × 54 mm card at 300 dpi
-    let w = 1011, h = 1011 * ar;
-    if (ar > 1) { h = 1011; w = h / ar; }
-    x.drawImage(p, (W - w) / 2, y, w, h);
-    y += h + 240;
+    const oc = await blobToCanvas(it.origBlob, 99999, MAX_PIXELS);
+    const r = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(it.quad) ? null : it.quad, filter: it.filter, adj: it.adj, rot: it.rot, maxDim: 99999, maxPx: MAX_PIXELS });
+    procs.push(imgDataToCanvas(r));
   }
-  return buildPage({ origBlob: await canvasToBlob(c, 'image/jpeg', 0.92), quad: FULL_QUAD, filter: 'original', adj: null, rot: 0, kind: 'id' });
+  // Each side is printed at its real size (85.6 × 54 mm) on A4, at a resolution
+  // high enough to keep the card's own detail (300–400 dpi).
+  const longest = Math.max(...procs.map((p) => Math.max(p.width, p.height)));
+  const dpi = clamp(longest / 3.37, 300, Math.sqrt(MAX_PIXELS / (8.27 * 11.69)));
+  const W = Math.round(8.27 * dpi), H = Math.round(11.69 * dpi), card = 3.37 * dpi;
+  const c = makeCanvas(W, H), x = c.getContext('2d');
+  x.fillStyle = '#fff'; x.fillRect(0, 0, W, H); x.imageSmoothingQuality = 'high';
+  let y = 1.5 * dpi;
+  for (const p of procs) {
+    const ar = p.height / p.width;
+    let w = card, h = card * ar;
+    if (ar > 1) { h = card; w = h / ar; }
+    x.drawImage(p, (W - w) / 2, y, w, h);
+    y += h + 0.8 * dpi;
+  }
+  return buildPage({ origBlob: await canvasToBlob(c, 'image/png'), quad: FULL_QUAD, filter: 'original', adj: null, rot: 0, kind: 'id' });
 }
 async function sessSave() {
   const s = Sess.s; if (!s) return;
@@ -396,8 +436,9 @@ Object.assign(A, {
   },
   'sess-detect': async () => {
     const it = Sess.s.items[Sess.s.idx];
+    await ensureItemImages(it);
     const q = await IP.run('detect', { img: getImageData(scaleCanvas(it.disp, 480)) });
-    if (q && quadConvex(q)) { it.quad = insetQuad(q, 0.004); it.detected = true; setupCrop(); }
+    if (q && quadConvex(q)) { it.quad = insetQuad(q, 0.007); it.detected = true; setupCrop(); }
     else toast('No clear page edge found. Drag the corners instead.');
   },
   'sess-full': () => { const it = Sess.s.items[Sess.s.idx]; it.quad = FULL_QUAD.slice(); it.detected = false; setupCrop(); },

@@ -532,8 +532,8 @@ function ipAspect(qp, W, H) {
   return isFinite(r) && r > 0 ? r : NaN;
 }
 
-// Output size for a quad (pixel coords) capped at maxDim.
-function ipQuadSize(qp, maxDim, W, H) {
+// Output size for a quad (pixel coords) capped at maxDim and maxPx.
+function ipQuadSize(qp, maxDim, W, H, maxPx) {
   function dist(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1]); }
   var w = Math.max(dist(qp[0], qp[1]), dist(qp[3], qp[2]));
   var h = Math.max(dist(qp[0], qp[3]), dist(qp[1], qp[2]));
@@ -544,18 +544,19 @@ function ipQuadSize(qp, maxDim, W, H) {
     }
   }
   var s = Math.min(1, maxDim / Math.max(w, h));
+  if (maxPx && w * h * s * s > maxPx) s = Math.sqrt(maxPx / (w * h));
   return [Math.max(8, Math.round(w * s)), Math.max(8, Math.round(h * s))];
 }
 
 // Perspective warp; quad is normalized [x0,y0..x3,y3] relative to img.
-function ipWarp(img, quad, maxDim) {
+function ipWarp(img, quad, maxDim, maxPx) {
   var W = img.width, H = img.height;
   var qp = [[quad[0] * W, quad[1] * H], [quad[2] * W, quad[3] * H], [quad[4] * W, quad[5] * H], [quad[6] * W, quad[7] * H]];
   var full = quad[0] <= 0 && quad[1] <= 0 && quad[2] >= 1 && quad[3] <= 0 && quad[4] >= 1 && quad[5] >= 1 && quad[6] <= 0 && quad[7] >= 1;
-  if (full && Math.max(W, H) <= maxDim) {
+  if (full && Math.max(W, H) <= maxDim && (!maxPx || W * H <= maxPx)) {
     return { data: new Uint8ClampedArray(img.data), width: W, height: H };
   }
-  var sz = ipQuadSize(qp, maxDim, W, H), ow = sz[0], oh = sz[1];
+  var sz = ipQuadSize(qp, maxDim, W, H, maxPx), ow = sz[0], oh = sz[1];
   var M = ipHomography([[0, 0], [ow, 0], [ow, oh], [0, oh]], qp);
   var out = ipNew(ow, oh), od = out.data, sd = img.data;
   var Wm = W - 1, Hm = H - 1;
@@ -686,7 +687,8 @@ function ipFilter(img, filter) {
     }
     od[j + 3] = 255;
   }
-  return out;
+  // A light unsharp mask restores the crispness that straightening softens.
+  return ipAdjust(out, { s: 22 });
 }
 
 // Brightness (-100..100), contrast (-100..100), sharpen (0..100).
@@ -731,8 +733,12 @@ function ipRotate(img, q) {
 // Full pipeline used for saving and previews.
 function ipProcess(p) {
   var img = p.img;
-  if (p.quad) img = ipWarp(img, p.quad, p.maxDim || 2400);
-  else if (p.maxDim && Math.max(img.width, img.height) > p.maxDim) img = ipResize(img, p.maxDim);
+  if (p.quad) img = ipWarp(img, p.quad, p.maxDim || 2400, p.maxPx);
+  else {
+    var lim = p.maxDim || 1e9, px = img.width * img.height;
+    if (p.maxPx && px > p.maxPx) lim = Math.min(lim, Math.floor(Math.max(img.width, img.height) * Math.sqrt(p.maxPx / px)));
+    if (Math.max(img.width, img.height) > lim) img = ipResize(img, lim);
+  }
   if (p.filter) img = ipFilter(img, p.filter);
   if (p.adj) img = ipAdjust(img, p.adj);
   if (p.rot) img = ipRotate(img, p.rot);

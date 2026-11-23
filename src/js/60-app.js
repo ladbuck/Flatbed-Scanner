@@ -11,7 +11,10 @@ const FILTERS = [
 ];
 const FULL_QUAD = [0, 0, 1, 0, 1, 1, 0, 1];
 const isFullQuad = (q) => !q || q.every((v, i) => Math.abs(v - FULL_QUAD[i]) < 1e-4);
-const STORE_MAX = 2400, STORE_JPEG = 0.9;
+// Scans keep the camera's full resolution while you work; quality is only
+// reduced at export, if you choose to. Photos above 16 megapixels (50 MP camera
+// modes) are scaled to 16 MP so phones don't run out of memory.
+const MAX_PIXELS = 16e6, PROC_JPEG = 0.96;
 const LOGO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M7 3h7l4 4v14H7z"/><path d="M3.5 12.5h17" style="stroke:var(--accent)"/></svg>';
 
 const S = { docs: [], settings: { ...DEFAULT_SETTINGS }, tab: 'home', folder: 'all', query: '', docId: null, select: null, reorder: false };
@@ -67,10 +70,10 @@ function allFolders() {
 async function buildPage(src, existing) {
   const origBlob = src.origBlob || await Store.getBlob(src.origKey);
   if (!origBlob) throw new Error('The original photo for this page is missing.');
-  const oc = await blobToCanvas(origBlob, STORE_MAX);
-  const res = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(src.quad) ? null : src.quad, filter: src.filter, adj: src.adj, rot: src.rot || 0, maxDim: STORE_MAX });
+  const oc = await blobToCanvas(origBlob, 99999, MAX_PIXELS);
+  const res = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(src.quad) ? null : src.quad, filter: src.filter, adj: src.adj, rot: src.rot || 0, maxDim: 99999, maxPx: MAX_PIXELS });
   const pc = imgDataToCanvas(res);
-  const procBlob = await canvasToBlob(pc, 'image/jpeg', STORE_JPEG);
+  const procBlob = await canvasToBlob(pc, 'image/jpeg', PROC_JPEG);
   const page = existing || { id: uid(), marks: [], ocr: null };
   const old = existing ? { orig: existing.orig, proc: existing.proc, thumb: existing.thumb } : null;
   page.orig = src.origKey || await Store.putBlob(origBlob);
@@ -256,6 +259,7 @@ function viewHome() {
     </div></header>
     <div class="wrap">
       <label class="search">${ic('search')}<input id="q" type="search" placeholder="Search names and text in scans" value="${esc(S.query)}" aria-label="Search documents" enterkeyhint="search"></label>
+      ${installCardHTML()}
       <div class="quick">
         <button data-act="q-scan">${ic('camera')}<span>Scan</span></button>
         <button data-act="q-import">${ic('image')}<span>Import photos</span></button>
@@ -398,8 +402,8 @@ function viewSettings() {
     <section class="section"><h2 class="section-title">Export</h2><div class="card">
       <div class="set-row"><div class="grow"><b>PDF page size</b></div>${selectHTML('pageSize', [['auto', 'Fit to image'], ['a4', 'A4 · 210 × 297 mm'], ['letter', 'Letter · 8.5 × 11 in'], ['legal', 'Legal · 8.5 × 14 in']])}</div>
       <div class="set-row"><div class="grow"><b>Margins</b></div>${selectHTML('margin', [['none', 'None'], ['small', 'Small · 6 mm'], ['wide', 'Wide · 15 mm']])}</div>
-      <div class="set-row"><div class="grow"><b>Quality</b><small>Smaller files are easier to email</small></div>${selectHTML('quality', [['small', 'Small file'], ['standard', 'Standard'], ['high', 'High']])}</div>
     </div></section>
+    ${installRowHTML()}
     <section class="section"><h2 class="section-title">Appearance</h2><div class="card">
       <div class="set-row"><div class="grow"><b>Theme</b></div>${selectHTML('theme', [['system', 'Match device'], ['light', 'Light'], ['dark', 'Dark']])}</div>
     </div></section>
@@ -460,3 +464,40 @@ async function makeSampleDoc() {
   S.docs.push(doc);
   await Store.putDoc(doc);
 }
+
+// --------------------------- Install as an app ------------------------------
+const PWA = { evt: null, dismissed: false };
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+function installCardHTML() {
+  if (IN_CLAUDE || !PWA.evt || PWA.dismissed || isStandalone()) return '';
+  return `<div class="install-card" role="region" aria-label="Install the app"><img src="icon-192.png" alt=""><div class="grow"><b>Install Flatbed</b><small>Opens from your home screen and works offline</small></div>
+    <button class="btn btn-sm btn-primary" data-act="pwa-install">Install</button><button class="icon-btn" data-act="pwa-dismiss" aria-label="Not now">${ic('x')}</button></div>`;
+}
+function installRowHTML() {
+  if (IN_CLAUDE) return '';
+  let small, ctl = '';
+  if (isStandalone()) small = 'Installed on this device';
+  else if (PWA.evt) { small = 'Adds Flatbed to your home screen and works offline'; ctl = '<button class="btn btn-sm btn-primary" data-act="pwa-install">Install</button>'; }
+  else if (isIOS()) small = 'In Safari, tap Share, then Add to Home Screen';
+  else small = 'Use your browser menu: Install app or Add to Home screen';
+  return `<section class="section"><h2 class="section-title">App</h2><div class="card"><div class="set-row">${ic('download', 'lead')}<div class="grow"><b>Install Flatbed</b><small>${small}</small></div>${ctl}</div></div></section>`;
+}
+function setupPWA() {
+  if (IN_CLAUDE) return;
+  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); PWA.evt = e; if (S.tab === 'home' || S.tab === 'settings') refreshView(); });
+  window.addEventListener('appinstalled', () => { PWA.evt = null; toast('Flatbed is installed', { type: 'ok' }); refreshView(); });
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    const reg = () => navigator.serviceWorker.register('sw.js').catch((e) => console.warn('Service worker', e));
+    if (document.readyState === 'complete') reg(); else window.addEventListener('load', reg);
+  }
+}
+Object.assign(A, {
+  'pwa-install': async () => {
+    const e = PWA.evt; if (!e) return;
+    PWA.evt = null;
+    try { await e.prompt(); const r = await e.userChoice; if (r && r.outcome !== 'accepted') PWA.dismissed = true; } catch (err) { /* prompt already used */ }
+    refreshView();
+  },
+  'pwa-dismiss': () => { PWA.dismissed = true; refreshView(); },
+});

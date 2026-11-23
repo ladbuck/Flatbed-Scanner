@@ -31,17 +31,24 @@ const OCR = {
         langs.push({ code: c, data: b64ToBytes((await r.text()).trim()) });
       }
       if (onProgress) onProgress(0.15, 'Starting text recognition…');
-      this.worker = await window.Tesseract.createWorker(langs, 1, {
+      this.worker = await withTimeout(window.Tesseract.createWorker(langs, 1, {
         workerPath: absUrl('lib/tesseract/worker.min.js'),
         corePath: absUrl('lib/tesseract/'),
         cacheMethod: 'none',
         workerBlobURL: true,
         logger: (m) => { if (this.onLog) this.onLog(m); },
         errorHandler: (e) => console.warn('OCR worker', e),
-      });
+      }), 120000, 'OCR start timed out');
       this.lang = lang;
     })();
-    try { await this.loading; } finally { this.loading = null; }
+    try { await this.loading; }
+    catch (e) {
+      console.warn('OCR start failed', e);
+      this.worker = null; this.lang = null;
+      throw new Error(navigator.onLine === false
+        ? 'Text recognition needs an internet connection the first time you use it. Connect once, then it works offline.'
+        : 'Text recognition could not start. Check your connection and try again.');
+    } finally { this.loading = null; }
     return this.worker;
   },
   async recognize(blob, lang, onProgress) {
@@ -90,10 +97,10 @@ const PDFIn = {
       throw new Error('This PDF could not be opened.');
     }
   },
-  async renderPage(pdf, n, maxDim = 2000) {
+  async renderPage(pdf, n, maxDim = 99999, maxPx = 16e6, dpi = 300) {
     const page = await pdf.getPage(n);
     const base = page.getViewport({ scale: 1 });
-    const scale = Math.min(4, maxDim / Math.max(base.width, base.height));
+    const scale = Math.min(dpi / 72, maxDim / Math.max(base.width, base.height), Math.sqrt(maxPx / (base.width * base.height)));
     const vp = page.getViewport({ scale });
     const c = makeCanvas(vp.width, vp.height), ctx = c.getContext('2d');
     ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);

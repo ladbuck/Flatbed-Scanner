@@ -146,8 +146,8 @@ async function importPdfFiles(files, opts = {}) {
         if (n > 200) throw new Error('This PDF has more than 200 pages. Split it first.');
         for (let i = 1; i <= n; i++) {
           busy.progress(i / (n + 1), `Importing ${files.length > 1 ? `file ${fi + 1} of ${files.length}, ` : ''}page ${i} of ${n}…`);
-          const { canvas, ocr } = await PDFIn.renderPage(pdf, i, 2000);
-          const page = await buildPage({ origBlob: await canvasToBlob(canvas, 'image/jpeg', 0.92), quad: FULL_QUAD, filter: 'original', adj: null, rot: 0 });
+          const { canvas, ocr } = await PDFIn.renderPage(pdf, i, 99999, MAX_PIXELS, 300);
+          const page = await buildPage({ origBlob: await canvasToBlob(canvas, 'image/png'), quad: FULL_QUAD, filter: 'original', adj: null, rot: 0 });
           if (ocr) page.ocr = ocr;
           pages.push(page);
         }
@@ -194,7 +194,7 @@ function renderViewer(o) {
       <button class="tbtn" data-act="vw-del">${ic('trash')}<span>Delete</span></button>
     </div>`;
   const p = d.pages[i];
-  renderPage(p, { maxDim: 2000 }).then((c) => {
+  renderPage(p, { maxDim: 3200 }).then((c) => {
     const v = $('#vw-view'); if (!v || viewerPage() !== p) return;
     v.innerHTML = ''; c.setAttribute('role', 'img'); c.setAttribute('aria-label', `Page ${i + 1}`); v.appendChild(c);
   }).catch(handleErr);
@@ -237,9 +237,11 @@ async function runOcr(doc, pages, lang) {
   const total = pages.length;
   for (let i = 0; i < total; i++) {
     const p = pages[i];
-    const blob = await Store.getBlob(p.proc);
+    let blob = await Store.getBlob(p.proc), ow = p.pw, oh = p.ph;
+    // Text recognition reads a copy of at most 3600 px; the saved page stays untouched.
+    if (Math.max(ow, oh) > 3600) { const c = await blobToCanvas(blob, 3600); ow = c.width; oh = c.height; blob = await canvasToBlob(c, 'image/jpeg', 0.92); }
     const data = await OCR.recognize(blob, lang, (f, m) => busy.progress((i + f) / total, total > 1 ? `${m} · page ${i + 1} of ${total}` : m));
-    p.ocr = ocrResultToPage(data, p.pw, p.ph, lang);
+    p.ocr = ocrResultToPage(data, ow, oh, lang);
   }
   await saveDoc(doc);
 }
@@ -371,7 +373,12 @@ Object.assign(A, {
         Sess.open();
       }).catch(handleErr) },
       { icon: 'copy', label: 'Duplicate page', fn: async () => { const np = await copyPage(p); d.pages.splice(Viewer.idx + 1, 0, np); await saveDoc(d); Viewer.idx++; refreshViewer(); refreshView(); } },
-      { icon: 'image', label: 'Save as JPG', fn: async () => { const c = await renderPage(p, { maxDim: 3000 }); deliverFile(`${safeName(d.title)}-p${Viewer.idx + 1}.jpg`, await canvasToBlob(c, 'image/jpeg', 0.92)); } },
+      { icon: 'image', label: 'Save as JPG', desc: 'Full resolution', fn: async () => {
+        const name = `${safeName(d.title)}-p${Viewer.idx + 1}.jpg`;
+        if (!(p.marks && p.marks.length)) { deliverFile(name, await Store.getBlob(p.proc)); return; }
+        const c = await busy.run('Preparing…', () => renderPage(p));
+        deliverFile(name, await canvasToBlob(c, 'image/jpeg', 0.95));
+      } },
       { icon: 'x', label: 'Clear mark-up', disabled: !(p.marks && p.marks.length), fn: async () => { for (const m of p.marks) if (m.blob) await Store.delBlob(m.blob); p.marks = []; await refreshThumb(p); await saveDoc(d); refreshViewer(); refreshView(); } },
     ]);
   },

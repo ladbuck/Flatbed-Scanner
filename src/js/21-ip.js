@@ -73,9 +73,9 @@ async function blobToImage(blob) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
   return img;
 }
-async function blobToCanvas(blob, maxDim = 99999) {
+async function blobToCanvas(blob, maxDim = 99999, maxPx = Infinity) {
   const img = await blobToImage(blob);
-  const w = img.naturalWidth, h = img.naturalHeight, s = Math.min(1, maxDim / Math.max(w, h));
+  const w = img.naturalWidth, h = img.naturalHeight, s = Math.min(1, maxDim / Math.max(w, h), Math.sqrt(maxPx / (w * h)));
   const c = makeCanvas(w * s, h * s), ctx = c.getContext('2d');
   ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);

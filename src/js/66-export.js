@@ -7,7 +7,13 @@ const EXPORT_FORMATS = [
 ];
 const PAGE_SIZES = { a4: [595.28, 841.89], letter: [612, 792], legal: [612, 1008] };
 const MARGINS = { none: 0, small: 17, wide: 42.5 };
-const QUAL = { small: { maxDim: 1500, jpeg: 0.62 }, standard: { maxDim: 2000, jpeg: 0.8 }, high: { maxDim: 2400, jpeg: 0.92 } };
+// Quality is chosen only here, at export. "Original" uses the saved scans as they are.
+const QUAL = {
+  original: { maxDim: 99999, jpeg: 0.95, keep: true, label: 'Original', desc: 'Full resolution, no extra compression', rel: 1 },
+  high: { maxDim: 3000, jpeg: 0.9, label: 'High', desc: 'Up to 3000 px, lightly compressed', rel: 0.62 },
+  medium: { maxDim: 2000, jpeg: 0.8, label: 'Medium', desc: 'Up to 2000 px, good for printing and sharing', rel: 0.48 },
+  small: { maxDim: 1400, jpeg: 0.65, label: 'Small', desc: 'Up to 1400 px, easy to email or send on chat apps', rel: 0.35 },
+};
 const WM_COLORS = ['#d0302a', '#14171a', '#2a44f0', '#808080'];
 
 let _dl = null;
@@ -20,7 +26,7 @@ async function deliverFile(name, blob) {
   if (dl) {
     try {
       await dl.save({ filename: name, data: blob });
-      toast(`Saved ${name}`, { type: 'ok' });
+      toast(`Saved ${name} · ${fmtBytes(blob.size)}`, { type: 'ok' });
       return true;
     } catch (e) {
       const code = e && e.code;
@@ -35,14 +41,14 @@ async function deliverFile(name, blob) {
   const a = document.createElement('a'); a.href = url; a.download = name; a.rel = 'noopener';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
-  toast(`Downloading ${name}`, { type: 'ok' });
+  toast(`Downloading ${name} · ${fmtBytes(blob.size)}`, { type: 'ok' });
   return true;
 }
 
 function openExport(doc, opts = {}) {
   const pages = opts.pageIds ? doc.pages.filter((p) => opts.pageIds.includes(p.id)) : doc.pages.slice();
   const st = {
-    fmt: opts.fmt || 'pdf', size: S.settings.pageSize, margin: S.settings.margin, quality: S.settings.quality,
+    fmt: opts.fmt || 'pdf', size: S.settings.pageSize, margin: S.settings.margin, quality: 'original',
     searchable: pages.every((p) => p.ocr && p.ocr.words && p.ocr.words.length), pw: !!opts.password, password: '', showPw: false,
     wm: !!opts.watermark, wmText: 'CONFIDENTIAL', wmMode: 'tile', wmOpacity: 0.18, wmColor: WM_COLORS[0],
     docxImages: true, name: safeName(doc.title) + (opts.pageIds ? ` (${pages.length} pp)` : ''),
@@ -58,9 +64,23 @@ function openExport(doc, opts = {}) {
   const body = s.body;
   const seg = (k, opts2) => `<div class="seg" data-k="${k}">${opts2.map(([v, l]) => `<button type="button" class="${String(st[k]) === String(v) ? 'on' : ''}" data-v="${esc(v)}">${esc(l)}</button>`).join('')}</div>`;
   const toggle = (k, title, small) => `<div class="toggle-row"><div class="grow"><b>${title}</b>${small ? `<small>${small}</small>` : ''}</div><label class="switch"><input type="checkbox" data-t="${k}" ${st[k] ? 'checked' : ''} aria-label="${esc(title)}"><span></span></label></div>`;
+  // Size estimates from the saved scans (exact for Original, approximate otherwise).
+  let savedBytes = 0, maxSide = 0;
+  Promise.all(pages.map((p) => Store.getBlob(p.proc))).then((bs) => {
+    savedBytes = bs.reduce((n, b) => n + (b ? b.size : 0), 0);
+    maxSide = Math.max(0, ...pages.map((p) => Math.max(p.pw || 0, p.ph || 0)));
+    const el = body.querySelector('#ex-qnote'); if (el) el.textContent = qualityNote();
+  });
+  function qualityNote() {
+    const Q = QUAL[st.quality];
+    if (!savedBytes) return Q.desc;
+    const side = Math.min(maxSide, Q.maxDim), scale = Math.min(1, Q.maxDim / Math.max(1, maxSide));
+    const est = Q.keep ? savedBytes : savedBytes * scale * scale * Q.rel;
+    return `${Q.desc}. Pages up to ${side} px · about ${fmtBytes(Math.round(est))} of images.`;
+  }
   function summary() {
     const n = pages.length;
-    return { pdf: `${n} ${n === 1 ? 'page' : 'pages'} → one PDF${st.pw ? ', password protected' : ''}`, jpg: n > 1 ? `${n} JPG images in one .zip` : 'One JPG image', png: n > 1 ? `${n} PNG images in one .zip` : 'One PNG image', docx: 'Word document with the recognised text' + (st.docxImages ? ' and page images' : ''), txt: 'Plain text from every page', long: `${n} ${n === 1 ? 'page' : 'pages'} stitched into one tall JPG` }[st.fmt];
+    return { pdf: `${n} ${n === 1 ? 'page' : 'pages'} → one PDF${st.pw ? ', password protected' : ''}`, jpg: n > 1 ? `${n} JPG images in one .zip` : 'One JPG image', png: n > 1 ? `${n} PNG images in one .zip` : 'One PNG image', docx: 'Word document with the recognised text' + (st.docxImages ? ' and page images' : ''), txt: 'Plain text from every page', long: `${n} ${n === 1 ? 'page' : 'pages'} stitched into one tall JPG (up to 2400 px wide)` }[st.fmt];
   }
   function draw() {
     const f = st.fmt, pdf = f === 'pdf', img = f === 'jpg' || f === 'png' || f === 'long';
@@ -71,7 +91,8 @@ function openExport(doc, opts = {}) {
       <label class="field"><span class="field-label">File name</span><input class="input" id="ex-name" value="${esc(st.name)}" autocomplete="off" maxlength="120"></label>
       ${pdf ? `<div class="opt-group"><span class="label">Page size</span>${seg('size', [['auto', 'Fit to image'], ['a4', 'A4'], ['letter', 'Letter'], ['legal', 'Legal']])}</div>
         <div class="opt-group"><span class="label">Margins</span>${seg('margin', [['none', 'None'], ['small', '6 mm'], ['wide', '15 mm']])}</div>` : ''}
-      ${pdf || img ? `<div class="opt-group"><span class="label">Quality</span>${seg('quality', [['small', 'Small file'], ['standard', 'Standard'], ['high', 'High']])}</div>` : ''}
+      ${pdf || img || f === 'docx' ? `<div class="opt-group"><span class="label">Quality</span>${seg('quality', Object.keys(QUAL).map((k) => [k, QUAL[k].label]))}
+        <p class="note" id="ex-qnote">${esc(qualityNote())}</p></div>` : ''}
       ${pdf ? toggle('searchable', 'Searchable text', 'Lets you select and search words in the PDF') : ''}
       ${pdf ? toggle('pw', 'Password protect', 'AES-256 encryption. Needed to open the file.') : ''}
       ${pdf && st.pw ? `<div class="sub"><label class="field"><span class="field-label">Password</span><div class="row"><input class="input grow" id="ex-pw" type="${st.showPw ? 'text' : 'password'}" value="${esc(st.password)}" autocomplete="new-password" placeholder="At least 4 characters"><button type="button" class="btn btn-sm" id="ex-show">${st.showPw ? 'Hide' : 'Show'}</button></div></label><p class="note">There is no way to recover a forgotten password. Note it somewhere safe.</p></div>` : ''}
@@ -102,7 +123,7 @@ function openExport(doc, opts = {}) {
 async function runExport(doc, pages, st) {
   const name = safeName(st.name || doc.title);
   const wm = st.wm ? { text: st.wmText.trim(), mode: st.wmMode, opacity: st.wmOpacity, color: st.wmColor } : null;
-  const Q = QUAL[st.quality] || QUAL.standard;
+  const Q = QUAL[st.quality] || QUAL.original;
   const needsText = st.fmt === 'docx' || st.fmt === 'txt' || (st.fmt === 'pdf' && st.searchable);
   busy.show('Preparing…');
   let blob, file;
@@ -117,15 +138,21 @@ async function runExport(doc, pages, st) {
       const type = st.fmt === 'png' ? 'image/png' : 'image/jpeg', files = [];
       for (let i = 0; i < pages.length; i++) {
         prog(i / pages.length, `Rendering page ${i + 1} of ${pages.length}…`);
-        const c = await renderPage(pages[i], { maxDim: Q.maxDim, watermark: wm });
-        files.push({ name: `${name}-${String(i + 1).padStart(2, '0')}.${st.fmt}`, data: await blobBytes(await canvasToBlob(c, type, Q.jpeg)) });
+        const pg = pages[i], fname = `${name}-${String(i + 1).padStart(2, '0')}.${st.fmt}`;
+        if (st.fmt === 'jpg' && Q.keep && !wm && !(pg.marks && pg.marks.length)) {
+          files.push({ name: fname, data: await blobBytes(await Store.getBlob(pg.proc)) });
+          continue;
+        }
+        const c = await renderPage(pg, { maxDim: Q.maxDim, watermark: wm });
+        files.push({ name: fname, data: await blobBytes(await canvasToBlob(c, type, Q.jpeg)) });
       }
       if (files.length === 1) { blob = new Blob([files[0].data], { type }); file = `${name}.${st.fmt}`; }
       else { blob = zipBuild(files); file = `${name}.zip`; }
     } else if (st.fmt === 'long') {
       const canv = [];
-      for (let i = 0; i < pages.length; i++) { prog(i / pages.length, `Rendering page ${i + 1} of ${pages.length}…`); canv.push(await renderPage(pages[i], { maxDim: Q.maxDim, watermark: wm })); }
-      let W = Math.min(1400, Math.max(...canv.map((c) => c.width)));
+      const longDim = Math.min(Q.maxDim, 2400);
+      for (let i = 0; i < pages.length; i++) { prog(i / pages.length, `Rendering page ${i + 1} of ${pages.length}…`); canv.push(await renderPage(pages[i], { maxDim: longDim, watermark: wm })); }
+      let W = Math.min(longDim, Math.max(...canv.map((c) => c.width)));
       const gap = 16;
       let H = canv.reduce((h, c) => h + Math.round(c.height * W / c.width), 0) + gap * (canv.length - 1);
       const lim = Math.min(1, 30000 / H, Math.sqrt(16e6 / (W * H)));
@@ -143,7 +170,10 @@ async function runExport(doc, pages, st) {
       for (let i = 0; i < pages.length; i++) {
         prog(i / pages.length, `Adding page ${i + 1} of ${pages.length}…`);
         const p = pages[i], sec = { heading: pages.length > 1 ? `Page ${doc.pages.indexOf(p) + 1}` : '', text: (p.ocr && p.ocr.text) || '' };
-        if (st.docxImages) { const c = await renderPage(p, { maxDim: 1600 }); sec.image = { data: await blobBytes(await canvasToBlob(c, 'image/jpeg', 0.82)), pxW: c.width, pxH: c.height }; }
+        if (st.docxImages) {
+          if (Q.keep && !(p.marks && p.marks.length) && p.pw) sec.image = { data: await blobBytes(await Store.getBlob(p.proc)), pxW: p.pw, pxH: p.ph };
+          else { const c = await renderPage(p, { maxDim: Q.maxDim }); sec.image = { data: await blobBytes(await canvasToBlob(c, 'image/jpeg', Q.jpeg)), pxW: c.width, pxH: c.height }; }
+        }
         sections.push(sec);
       }
       blob = docxBuild(sections, doc.title); file = name + '.docx';
@@ -163,7 +193,7 @@ async function buildPdfExport(doc, pages, st, Q, wm, prog) {
       const z = await deflateBytes(await IP.run('pack1', { img: getImageData(c) }));
       if (z) image = { kind: 'bw1', data: z, pxW: c.width, pxH: c.height };
     }
-    if (!image && plain && st.quality === 'high' && p.pw && p.ph) {
+    if (!image && plain && Q.keep && p.pw && p.ph) {
       image = { kind: 'jpeg', data: await blobBytes(await Store.getBlob(p.proc)), pxW: p.pw, pxH: p.ph };
     }
     if (!image) {

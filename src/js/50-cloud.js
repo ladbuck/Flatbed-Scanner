@@ -53,8 +53,14 @@ const Cloud = {
   async upKey(key, type) {
     if (!key) return null;
     if (this.map[key]) return this.map[key];
-    const blob = await Store.getBlob(key);
+    let blob = await Store.getBlob(key);
     if (!blob) return null;
+    if (blob.size > 19.5 * 1048576 && /^image\//.test(type)) {
+      // Cloud files are capped at 20 MB: back up a full-resolution JPEG copy instead.
+      blob = await canvasToBlob(await blobToCanvas(blob, 99999, MAX_PIXELS), 'image/jpeg', 0.92);
+      type = 'image/jpeg';
+    }
+    if (/^image\/(png|jpeg|webp|gif)$/.test(blob.type)) type = blob.type;
     const r = await this.assets.upload(blob, { type });
     this.map[key] = r.id; this.rev[r.id] = key;
     await this.saveMap();
