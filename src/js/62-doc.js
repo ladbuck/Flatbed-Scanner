@@ -194,9 +194,13 @@ function renderViewer(o) {
       <button class="tbtn" data-act="vw-del">${ic('trash')}<span>Delete</span></button>
     </div>`;
   const p = d.pages[i];
-  renderPage(p, { maxDim: 3200 }).then((c) => {
+  // Show the saved page itself as an image at full resolution: the browser
+  // scales images smoothly, and zooming reveals every pixel that was kept.
+  pageImageUrl(p).then((url) => {
     const v = $('#vw-view'); if (!v || viewerPage() !== p) return;
-    v.innerHTML = ''; c.setAttribute('role', 'img'); c.setAttribute('aria-label', `Page ${i + 1}`); v.appendChild(c);
+    const im = new Image(); im.alt = `Page ${i + 1}`; im.decoding = 'async'; im.src = url;
+    im.onload = () => { if (Viewer.zoom) im.style.width = (im.naturalWidth / DPR()) + 'px'; };
+    v.innerHTML = ''; v.appendChild(im);
   }).catch(handleErr);
   const v = o.el.querySelector('#vw-view');
   let sx = 0, sy = 0, t0 = 0;
@@ -205,7 +209,47 @@ function renderViewer(o) {
     const dx = e.clientX - sx, dy = e.clientY - sy;
     if (!Viewer.zoom && Math.abs(dx) > 60 && Math.abs(dy) < 60 && Date.now() - t0 < 600) { Viewer.idx = clamp(Viewer.idx + (dx < 0 ? 1 : -1), 0, n - 1); renderViewer(o); }
   });
-  v.addEventListener('dblclick', () => { Viewer.zoom = !Viewer.zoom; v.classList.toggle('zoom', Viewer.zoom); });
+  v.addEventListener('dblclick', (e) => {
+    const im = v.querySelector('img'); if (!im) return;
+    const r = im.getBoundingClientRect(), fx = (e.clientX - r.left) / r.width, fy = (e.clientY - r.top) / r.height;
+    Viewer.zoom = !Viewer.zoom; v.classList.toggle('zoom', Viewer.zoom);
+    im.style.width = Viewer.zoom ? (im.naturalWidth / DPR()) + 'px' : '';
+    if (Viewer.zoom) requestAnimationFrame(() => { v.scrollLeft = fx * im.offsetWidth - v.clientWidth / 2; v.scrollTop = fy * im.offsetHeight - v.clientHeight / 2; });
+  });
+}
+// Full-resolution image URL for a page: the saved scan, or a composite when it has mark-up.
+const compositeUrls = new Map();
+async function pageImageUrl(p) {
+  if (!(p.marks && p.marks.length)) return blobUrl(p.proc);
+  const key = p.proc + '|' + JSON.stringify(p.marks).length + '|' + p.thumb;
+  const hit = compositeUrls.get(p.id);
+  if (hit && hit.key === key) return hit.url;
+  if (hit) URL.revokeObjectURL(hit.url);
+  const c = await renderPage(p);
+  const url = URL.createObjectURL(await canvasToBlob(c, 'image/jpeg', 0.95));
+  compositeUrls.set(p.id, { key, url });
+  return url;
+}
+async function pageDetails(doc, p) {
+  const [orig, proc] = await Promise.all([Store.getBlob(p.orig), Store.getBlob(p.proc)]);
+  let nat = null;
+  try { if (orig) { const im = await blobToImage(orig); nat = [im.naturalWidth, im.naturalHeight]; } } catch (e) { /* unreadable */ }
+  const mp = (w, h) => (w * h / 1e6).toFixed(1) + ' MP';
+  const kind = (b) => (b && b.type ? b.type.replace('image/', '').toUpperCase().replace('JPEG', 'JPG') : '');
+  const scaled = nat && nat[0] * nat[1] > MAX_PIXELS * 1.01;
+  const look = (FILTERS.find((f) => f.id === p.filter) || {}).label || 'Original';
+  const row = (k, v) => `<div class="set-row"><div class="grow"><small>${esc(k)}</small><b class="mono" style="font-weight:500">${esc(v)}</b></div></div>`;
+  openSheet({
+    title: `Page ${doc.pages.indexOf(p) + 1} details`,
+    body: `<div class="card">
+      ${row('Your photo (stored untouched)', nat ? `${nat[0]} × ${nat[1]} px · ${mp(nat[0], nat[1])} · ${kind(orig)} · ${fmtBytes(orig.size)}` : 'Not available')}
+      ${row('Processed at', `${p.ow} × ${p.oh} px · ${mp(p.ow, p.oh)}`)}
+      ${row('Saved page (after crop)', `${p.pw} × ${p.ph} px · ${kind(proc)} · ${fmtBytes(proc ? proc.size : 0)}`)}
+      ${row('Look', look + (p.adj && (p.adj.b || p.adj.c || p.adj.s) ? ' · adjusted' : ''))}
+    </div>
+    <p class="note">${scaled ? `This photo is larger than ${MAX_PIXELS / 1e6} megapixels, so it was processed at ${MAX_PIXELS / 1e6} MP to fit in your phone’s memory. The full photo is still stored.` : 'Nothing was scaled down: the saved page uses every pixel of the page area in your photo.'} The saved page is smaller than the photo only because the background around the page is cropped away.${p.filter !== 'original' ? ' The look changes colours and contrast; choose Original under Crop & look to keep the photo’s own appearance.' : ''}</p>`,
+    actions: [{ label: 'Close' }],
+  });
 }
 async function rotatePage(doc, page, dir = 1) {
   const W = page.pw, H = page.ph;
@@ -364,6 +408,7 @@ Object.assign(A, {
   'vw-more': () => {
     const d = getDoc(Viewer.docId), p = viewerPage();
     menuSheet(`Page ${Viewer.idx + 1}`, [
+      { icon: 'info', label: 'Page details', desc: 'Resolution and file size', fn: () => pageDetails(d, p).catch(handleErr) },
       { icon: 'rotl', label: 'Rotate left', fn: async () => { await rotatePage(d, p, -1); refreshViewer(); refreshView(); } },
       { icon: 'camera', label: 'Retake this page', fn: () => pickFiles('camera', false).then(async (f) => {
         if (!f.length) return;

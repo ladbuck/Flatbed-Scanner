@@ -2,7 +2,7 @@
 // ---------------------------------------------------------------------------
 // Utilities, icons, dialogs, toasts, busy overlay
 // ---------------------------------------------------------------------------
-const APP_VERSION = '1.0';
+const APP_VERSION = '1.4';
 const A = {}; // click actions, keyed by data-act
 // True when the page runs inside Claude (artifact), where backup, AI and downloads capabilities exist.
 const IN_CLAUDE = !!(window.claude && typeof window.claude.use === 'function');

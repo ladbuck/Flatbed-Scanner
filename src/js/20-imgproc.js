@@ -398,10 +398,15 @@ function ipRefineQuad(P, q) {
   for (i = 0; i < 4; i++) {
     var a = q[i], b = q[(i + 1) % 4], dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1;
     var nx = -dy / L, ny = dx / L, best = -1, ba = 0, bb = 0;
-    for (var da = -5; da <= 5; da++) for (var db = -5; db <= 5; db++) {
-      var s = ipSideScore(P, a[0] + nx * da, a[1] + ny * da, b[0] + nx * db, b[1] + ny * db, 1.8) - 0.002 * (Math.abs(da) + Math.abs(db));
+    // Coarse search over a wide range, then fine steps around the best fit.
+    var tryAt = function (da, db) {
+      var s = ipSideScore(P, a[0] + nx * da, a[1] + ny * da, b[0] + nx * db, b[1] + ny * db, 1.8) - 0.0015 * (Math.abs(da) + Math.abs(db));
       if (s > best) { best = s; ba = da; bb = db; }
-    }
+    };
+    var lim = Math.max(6, Math.round(L * 0.04));
+    for (var da = -lim; da <= lim; da += 2) for (var db = -lim; db <= lim; db += 2) tryAt(da, db);
+    var ca = ba, cb = bb;
+    for (var fa = -2; fa <= 2; fa++) for (var fb = -2; fb <= 2; fb++) tryAt(ca + fa, cb + fb);
     lines.push([[a[0] + nx * ba, a[1] + ny * ba], [b[0] + nx * bb, b[1] + ny * bb]]);
   }
   P.narrow = false;
