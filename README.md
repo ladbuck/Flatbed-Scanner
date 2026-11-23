@@ -14,6 +14,8 @@ A document scanner that runs entirely in the browser, with the features you'd us
 - Folders, stars, sorting, light and dark themes
 - **Installable app** (Add to Home Screen) that works offline; text recognition data is saved for offline use the first time you use it
 
+Scans keep full camera resolution while you work (photos above 16 megapixels are scaled to 16 MP to stay within phone memory). The original photo is stored untouched; quality is only reduced at export, where you choose Original, High, Medium or Small.
+
 Scans are stored in the browser (IndexedDB) on the device that made them. Nothing is uploaded unless you export it.
 
 When the same page is opened as a Claude artifact, it also gets private cloud backup and sync, and "Ask Claude" tools (summarize, translate, transcribe handwriting, Q&A). Those features switch off automatically elsewhere.

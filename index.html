@@ -1294,8 +1294,8 @@ function ipAspect(qp, W, H) {
   return isFinite(r) && r > 0 ? r : NaN;
 }
 
-// Output size for a quad (pixel coords) capped at maxDim.
-function ipQuadSize(qp, maxDim, W, H) {
+// Output size for a quad (pixel coords) capped at maxDim and maxPx.
+function ipQuadSize(qp, maxDim, W, H, maxPx) {
   function dist(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1]); }
   var w = Math.max(dist(qp[0], qp[1]), dist(qp[3], qp[2]));
   var h = Math.max(dist(qp[0], qp[3]), dist(qp[1], qp[2]));
@@ -1306,18 +1306,19 @@ function ipQuadSize(qp, maxDim, W, H) {
     }
   }
   var s = Math.min(1, maxDim / Math.max(w, h));
+  if (maxPx && w * h * s * s > maxPx) s = Math.sqrt(maxPx / (w * h));
   return [Math.max(8, Math.round(w * s)), Math.max(8, Math.round(h * s))];
 }
 
 // Perspective warp; quad is normalized [x0,y0..x3,y3] relative to img.
-function ipWarp(img, quad, maxDim) {
+function ipWarp(img, quad, maxDim, maxPx) {
   var W = img.width, H = img.height;
   var qp = [[quad[0] * W, quad[1] * H], [quad[2] * W, quad[3] * H], [quad[4] * W, quad[5] * H], [quad[6] * W, quad[7] * H]];
   var full = quad[0] <= 0 && quad[1] <= 0 && quad[2] >= 1 && quad[3] <= 0 && quad[4] >= 1 && quad[5] >= 1 && quad[6] <= 0 && quad[7] >= 1;
-  if (full && Math.max(W, H) <= maxDim) {
+  if (full && Math.max(W, H) <= maxDim && (!maxPx || W * H <= maxPx)) {
     return { data: new Uint8ClampedArray(img.data), width: W, height: H };
   }
-  var sz = ipQuadSize(qp, maxDim, W, H), ow = sz[0], oh = sz[1];
+  var sz = ipQuadSize(qp, maxDim, W, H, maxPx), ow = sz[0], oh = sz[1];
   var M = ipHomography([[0, 0], [ow, 0], [ow, oh], [0, oh]], qp);
   var out = ipNew(ow, oh), od = out.data, sd = img.data;
   var Wm = W - 1, Hm = H - 1;
@@ -1448,7 +1449,8 @@ function ipFilter(img, filter) {
     }
     od[j + 3] = 255;
   }
-  return out;
+  // A light unsharp mask restores the crispness that straightening softens.
+  return ipAdjust(out, { s: 22 });
 }
 
 // Brightness (-100..100), contrast (-100..100), sharpen (0..100).
@@ -1493,8 +1495,12 @@ function ipRotate(img, q) {
 // Full pipeline used for saving and previews.
 function ipProcess(p) {
   var img = p.img;
-  if (p.quad) img = ipWarp(img, p.quad, p.maxDim || 2400);
-  else if (p.maxDim && Math.max(img.width, img.height) > p.maxDim) img = ipResize(img, p.maxDim);
+  if (p.quad) img = ipWarp(img, p.quad, p.maxDim || 2400, p.maxPx);
+  else {
+    var lim = p.maxDim || 1e9, px = img.width * img.height;
+    if (p.maxPx && px > p.maxPx) lim = Math.min(lim, Math.floor(Math.max(img.width, img.height) * Math.sqrt(p.maxPx / px)));
+    if (Math.max(img.width, img.height) > lim) img = ipResize(img, lim);
+  }
   if (p.filter) img = ipFilter(img, p.filter);
   if (p.adj) img = ipAdjust(img, p.adj);
   if (p.rot) img = ipRotate(img, p.rot);
@@ -1609,9 +1615,9 @@ async function blobToImage(blob) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
   return img;
 }
-async function blobToCanvas(blob, maxDim = 99999) {
+async function blobToCanvas(blob, maxDim = 99999, maxPx = Infinity) {
   const img = await blobToImage(blob);
-  const w = img.naturalWidth, h = img.naturalHeight, s = Math.min(1, maxDim / Math.max(w, h));
+  const w = img.naturalWidth, h = img.naturalHeight, s = Math.min(1, maxDim / Math.max(w, h), Math.sqrt(maxPx / (w * h)));
   const c = makeCanvas(w * s, h * s), ctx = c.getContext('2d');
   ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
@@ -2001,10 +2007,10 @@ const PDFIn = {
       throw new Error('This PDF could not be opened.');
     }
   },
-  async renderPage(pdf, n, maxDim = 2000) {
+  async renderPage(pdf, n, maxDim = 99999, maxPx = 16e6, dpi = 300) {
     const page = await pdf.getPage(n);
     const base = page.getViewport({ scale: 1 });
-    const scale = Math.min(4, maxDim / Math.max(base.width, base.height));
+    const scale = Math.min(dpi / 72, maxDim / Math.max(base.width, base.height), Math.sqrt(maxPx / (base.width * base.height)));
     const vp = page.getViewport({ scale });
     const c = makeCanvas(vp.width, vp.height), ctx = c.getContext('2d');
     ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
@@ -2104,8 +2110,14 @@ const Cloud = {
   async upKey(key, type) {
     if (!key) return null;
     if (this.map[key]) return this.map[key];
-    const blob = await Store.getBlob(key);
+    let blob = await Store.getBlob(key);
     if (!blob) return null;
+    if (blob.size > 19.5 * 1048576 && /^image\//.test(type)) {
+      // Cloud files are capped at 20 MB: back up a full-resolution JPEG copy instead.
+      blob = await canvasToBlob(await blobToCanvas(blob, 99999, MAX_PIXELS), 'image/jpeg', 0.92);
+      type = 'image/jpeg';
+    }
+    if (/^image\/(png|jpeg|webp|gif)$/.test(blob.type)) type = blob.type;
     const r = await this.assets.upload(blob, { type });
     this.map[key] = r.id; this.rev[r.id] = key;
     await this.saveMap();
@@ -2329,7 +2341,10 @@ const FILTERS = [
 ];
 const FULL_QUAD = [0, 0, 1, 0, 1, 1, 0, 1];
 const isFullQuad = (q) => !q || q.every((v, i) => Math.abs(v - FULL_QUAD[i]) < 1e-4);
-const STORE_MAX = 2400, STORE_JPEG = 0.9;
+// Scans keep the camera's full resolution while you work; quality is only
+// reduced at export, if you choose to. Photos above 16 megapixels (50 MP camera
+// modes) are scaled to 16 MP so phones don't run out of memory.
+const MAX_PIXELS = 16e6, PROC_JPEG = 0.96;
 const LOGO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M7 3h7l4 4v14H7z"/><path d="M3.5 12.5h17" style="stroke:var(--accent)"/></svg>';
 
 const S = { docs: [], settings: { ...DEFAULT_SETTINGS }, tab: 'home', folder: 'all', query: '', docId: null, select: null, reorder: false };
@@ -2385,10 +2400,10 @@ function allFolders() {
 async function buildPage(src, existing) {
   const origBlob = src.origBlob || await Store.getBlob(src.origKey);
   if (!origBlob) throw new Error('The original photo for this page is missing.');
-  const oc = await blobToCanvas(origBlob, STORE_MAX);
-  const res = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(src.quad) ? null : src.quad, filter: src.filter, adj: src.adj, rot: src.rot || 0, maxDim: STORE_MAX });
+  const oc = await blobToCanvas(origBlob, 99999, MAX_PIXELS);
+  const res = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(src.quad) ? null : src.quad, filter: src.filter, adj: src.adj, rot: src.rot || 0, maxDim: 99999, maxPx: MAX_PIXELS });
   const pc = imgDataToCanvas(res);
-  const procBlob = await canvasToBlob(pc, 'image/jpeg', STORE_JPEG);
+  const procBlob = await canvasToBlob(pc, 'image/jpeg', PROC_JPEG);
   const page = existing || { id: uid(), marks: [], ocr: null };
   const old = existing ? { orig: existing.orig, proc: existing.proc, thumb: existing.thumb } : null;
   page.orig = src.origKey || await Store.putBlob(origBlob);
@@ -2717,7 +2732,6 @@ function viewSettings() {
     <section class="section"><h2 class="section-title">Export</h2><div class="card">
       <div class="set-row"><div class="grow"><b>PDF page size</b></div>${selectHTML('pageSize', [['auto', 'Fit to image'], ['a4', 'A4 · 210 × 297 mm'], ['letter', 'Letter · 8.5 × 11 in'], ['legal', 'Legal · 8.5 × 14 in']])}</div>
       <div class="set-row"><div class="grow"><b>Margins</b></div>${selectHTML('margin', [['none', 'None'], ['small', 'Small · 6 mm'], ['wide', 'Wide · 15 mm']])}</div>
-      <div class="set-row"><div class="grow"><b>Quality</b><small>Smaller files are easier to email</small></div>${selectHTML('quality', [['small', 'Small file'], ['standard', 'Standard'], ['high', 'High']])}</div>
     </div></section>
     ${installRowHTML()}
     <section class="section"><h2 class="section-title">Appearance</h2><div class="card">
@@ -2865,22 +2879,47 @@ function insetQuad(q, f) {
   return q.map((v, i) => clamp(v + ((i % 2 ? cy : cx) - v) * f * 2.5, 0, 1));
 }
 async function makeItem(file, from) {
-  const c = await blobToCanvas(file, STORE_MAX);
-  const origBlob = from ? file : await canvasToBlob(c, 'image/jpeg', 0.9);
+  const img = await blobToImage(file);
+  const nw = img.naturalWidth, nh = img.naturalHeight;
+  const small = (dim) => {
+    const sc = Math.min(1, dim / Math.max(nw, nh)), c = makeCanvas(nw * sc, nh * sc), cx = c.getContext('2d');
+    cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+    cx.fillStyle = '#fff'; cx.fillRect(0, 0, c.width, c.height); cx.drawImage(img, 0, 0, c.width, c.height);
+    return c;
+  };
+  const det = small(480);
+  // The photo is kept exactly as the camera saved it. Only formats that other
+  // browsers may not open (HEIC and the like) are converted, at full resolution.
+  let origBlob = file;
+  if (!from && !/^image\/(jpe?g|png|webp)$/i.test(file.type || '')) origBlob = await canvasToBlob(await blobToCanvas(file, 99999, MAX_PIXELS), 'image/jpeg', PROC_JPEG);
   const item = {
-    id: uid(), origBlob, ow: c.width, oh: c.height,
-    disp: scaleCanvas(c, 1400), prev: getImageData(scaleCanvas(c, 1000)),
+    id: uid(), origBlob, ow: nw, oh: nh, thumbUrl: scaleCanvas(det, 120).toDataURL('image/jpeg', 0.7),
     quad: FULL_QUAD.slice(), detected: false, filter: S.settings.filter, adj: { b: 0, c: 0, s: 0 }, rot: 0,
   };
   if (from) {
     Object.assign(item, { origKey: from.orig, quad: (from.quad || FULL_QUAD).slice(), filter: from.filter || 'original', adj: { b: 0, c: 0, s: 0, ...(from.adj || {}) }, rot: from.rot || 0, kind: from.kind });
   } else if (S.settings.autoCrop) {
     try {
-      const q = await IP.run('detect', { img: getImageData(scaleCanvas(c, 480)) });
-      if (q && quadConvex(q)) { item.quad = insetQuad(q, 0.004); item.detected = true; }
+      const q = await IP.run('detect', { img: getImageData(det) });
+      if (q && quadConvex(q)) { item.quad = insetQuad(q, 0.007); item.detected = true; }
     } catch (e) { console.warn('detect failed', e); }
   }
   return item;
+}
+// Screen-sized copies are made only for the photo being edited, so long
+// batches don't run out of memory and previews stay sharp.
+async function ensureItemImages(it) {
+  if (it.disp) return;
+  if (!it.loading) {
+    it.loading = blobToCanvas(it.origBlob, 2000).then((c) => {
+      it.disp = c; it.prev = getImageData(scaleCanvas(c, 1400));
+    }).finally(() => { it.loading = null; });
+  }
+  await it.loading;
+}
+function releaseOtherItems() {
+  const s = Sess.s; if (!s) return;
+  s.items.forEach((x, i) => { if (i !== s.idx) { x.disp = null; x.prev = null; x.warped = null; x.chips = null; x.warpKey = null; } });
 }
 
 const Sess = {
@@ -2929,6 +2968,7 @@ function renderSess(o) {
   const s = Sess.s; if (!s) return;
   const it = s.items[s.idx];
   const crop = s.step === 'crop';
+  releaseOtherItems();
   makeStripThumbs();
   const canAdd = s.mode !== 'edit' && !(s.mode === 'id' && s.items.length >= 2);
   const side = s.mode === 'id' ? (s.idx === 0 ? 'Front side · ' : 'Back side · ') : '';
@@ -2977,13 +3017,18 @@ function renderSess(o) {
   }
 }
 function makeStripThumbs() {
-  for (const x of Sess.s.items) if (!x.thumbUrl) x.thumbUrl = scaleCanvas(x.disp, 120).toDataURL('image/jpeg', 0.7);
+  for (const x of Sess.s.items) if (!x.thumbUrl && x.disp) x.thumbUrl = scaleCanvas(x.disp, 120).toDataURL('image/jpeg', 0.7);
 }
 
 // ---------------------------- Crop corners ---------------------------------
 function setupCrop() {
   const s = Sess.s; if (!s) return;
   const it = s.items[s.idx], stage = $('#sess-stage'); if (!stage) return;
+  if (!it.disp) {
+    stage.innerHTML = '<div class="stage-msg">Opening photo…</div>';
+    ensureItemImages(it).then(() => { if (Sess.s && Sess.s.items[Sess.s.idx] === it && Sess.s.step === 'crop') setupCrop(); }).catch(handleErr);
+    return;
+  }
   stage.innerHTML = '';
   const r = stage.getBoundingClientRect(), pad = 24, img = it.disp, dpr = DPR();
   const sc = Math.min((r.width - pad * 2) / img.width, (r.height - pad * 2) / img.height);
@@ -3068,7 +3113,8 @@ function setupCrop() {
 async function ensureWarped(it) {
   const key = it.quad.join(',');
   if (it.warped && it.warpKey === key) return;
-  it.warped = await IP.run('process', { img: it.prev, quad: isFullQuad(it.quad) ? null : it.quad, maxDim: 1000 });
+  await ensureItemImages(it);
+  it.warped = await IP.run('process', { img: it.prev, quad: isFullQuad(it.quad) ? null : it.quad, maxDim: 1400 });
   it.warpKey = key; it.chips = null;
 }
 async function setupEnhance() {
@@ -3112,30 +3158,38 @@ async function drawPreview() {
 
 // ------------------------------- Saving ------------------------------------
 async function bookPages(it) {
-  const oc = await blobToCanvas(it.origBlob, STORE_MAX);
-  const warped = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(it.quad) ? null : it.quad, rot: it.rot, maxDim: STORE_MAX });
+  const oc = await blobToCanvas(it.origBlob, 99999, MAX_PIXELS);
+  const warped = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(it.quad) ? null : it.quad, rot: it.rot, maxDim: 99999, maxPx: MAX_PIXELS });
   const wc = imgDataToCanvas(warped), half = Math.round(wc.width / 2), out = [];
   for (const [x0, w] of [[0, half], [half, wc.width - half]]) {
     const c = makeCanvas(w, wc.height); c.getContext('2d').drawImage(wc, x0, 0, w, wc.height, 0, 0, w, wc.height);
-    out.push(await buildPage({ origBlob: await canvasToBlob(c, 'image/jpeg', 0.92), quad: FULL_QUAD, filter: it.filter, adj: it.adj, rot: 0 }));
+    out.push(await buildPage({ origBlob: await canvasToBlob(c, 'image/png'), quad: FULL_QUAD, filter: it.filter, adj: it.adj, rot: 0 }));
   }
   return out;
 }
 async function idCardPage(items) {
-  const W = 2480, H = 3508, c = makeCanvas(W, H), x = c.getContext('2d');
-  x.fillStyle = '#fff'; x.fillRect(0, 0, W, H);
-  let y = 460;
+  const procs = [];
   for (const it of items) {
-    const oc = await blobToCanvas(it.origBlob, STORE_MAX);
-    const r = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(it.quad) ? null : it.quad, filter: it.filter, adj: it.adj, rot: it.rot, maxDim: 1600 });
-    const p = imgDataToCanvas(r), ar = p.height / p.width;
-    // 85.6 × 54 mm card at 300 dpi
-    let w = 1011, h = 1011 * ar;
-    if (ar > 1) { h = 1011; w = h / ar; }
-    x.drawImage(p, (W - w) / 2, y, w, h);
-    y += h + 240;
+    const oc = await blobToCanvas(it.origBlob, 99999, MAX_PIXELS);
+    const r = await IP.run('process', { img: getImageData(oc), quad: isFullQuad(it.quad) ? null : it.quad, filter: it.filter, adj: it.adj, rot: it.rot, maxDim: 99999, maxPx: MAX_PIXELS });
+    procs.push(imgDataToCanvas(r));
   }
-  return buildPage({ origBlob: await canvasToBlob(c, 'image/jpeg', 0.92), quad: FULL_QUAD, filter: 'original', adj: null, rot: 0, kind: 'id' });
+  // Each side is printed at its real size (85.6 × 54 mm) on A4, at a resolution
+  // high enough to keep the card's own detail (300–400 dpi).
+  const longest = Math.max(...procs.map((p) => Math.max(p.width, p.height)));
+  const dpi = clamp(longest / 3.37, 300, Math.sqrt(MAX_PIXELS / (8.27 * 11.69)));
+  const W = Math.round(8.27 * dpi), H = Math.round(11.69 * dpi), card = 3.37 * dpi;
+  const c = makeCanvas(W, H), x = c.getContext('2d');
+  x.fillStyle = '#fff'; x.fillRect(0, 0, W, H); x.imageSmoothingQuality = 'high';
+  let y = 1.5 * dpi;
+  for (const p of procs) {
+    const ar = p.height / p.width;
+    let w = card, h = card * ar;
+    if (ar > 1) { h = card; w = h / ar; }
+    x.drawImage(p, (W - w) / 2, y, w, h);
+    y += h + 0.8 * dpi;
+  }
+  return buildPage({ origBlob: await canvasToBlob(c, 'image/png'), quad: FULL_QUAD, filter: 'original', adj: null, rot: 0, kind: 'id' });
 }
 async function sessSave() {
   const s = Sess.s; if (!s) return;
@@ -3216,8 +3270,9 @@ Object.assign(A, {
   },
   'sess-detect': async () => {
     const it = Sess.s.items[Sess.s.idx];
+    await ensureItemImages(it);
     const q = await IP.run('detect', { img: getImageData(scaleCanvas(it.disp, 480)) });
-    if (q && quadConvex(q)) { it.quad = insetQuad(q, 0.004); it.detected = true; setupCrop(); }
+    if (q && quadConvex(q)) { it.quad = insetQuad(q, 0.007); it.detected = true; setupCrop(); }
     else toast('No clear page edge found. Drag the corners instead.');
   },
   'sess-full': () => { const it = Sess.s.items[Sess.s.idx]; it.quad = FULL_QUAD.slice(); it.detected = false; setupCrop(); },
@@ -3394,8 +3449,8 @@ async function importPdfFiles(files, opts = {}) {
         if (n > 200) throw new Error('This PDF has more than 200 pages. Split it first.');
         for (let i = 1; i <= n; i++) {
           busy.progress(i / (n + 1), `Importing ${files.length > 1 ? `file ${fi + 1} of ${files.length}, ` : ''}page ${i} of ${n}…`);
-          const { canvas, ocr } = await PDFIn.renderPage(pdf, i, 2000);
-          const page = await buildPage({ origBlob: await canvasToBlob(canvas, 'image/jpeg', 0.92), quad: FULL_QUAD, filter: 'original', adj: null, rot: 0 });
+          const { canvas, ocr } = await PDFIn.renderPage(pdf, i, 99999, MAX_PIXELS, 300);
+          const page = await buildPage({ origBlob: await canvasToBlob(canvas, 'image/png'), quad: FULL_QUAD, filter: 'original', adj: null, rot: 0 });
           if (ocr) page.ocr = ocr;
           pages.push(page);
         }
@@ -3442,7 +3497,7 @@ function renderViewer(o) {
       <button class="tbtn" data-act="vw-del">${ic('trash')}<span>Delete</span></button>
     </div>`;
   const p = d.pages[i];
-  renderPage(p, { maxDim: 2000 }).then((c) => {
+  renderPage(p, { maxDim: 3200 }).then((c) => {
     const v = $('#vw-view'); if (!v || viewerPage() !== p) return;
     v.innerHTML = ''; c.setAttribute('role', 'img'); c.setAttribute('aria-label', `Page ${i + 1}`); v.appendChild(c);
   }).catch(handleErr);
@@ -3485,9 +3540,11 @@ async function runOcr(doc, pages, lang) {
   const total = pages.length;
   for (let i = 0; i < total; i++) {
     const p = pages[i];
-    const blob = await Store.getBlob(p.proc);
+    let blob = await Store.getBlob(p.proc), ow = p.pw, oh = p.ph;
+    // Text recognition reads a copy of at most 3600 px; the saved page stays untouched.
+    if (Math.max(ow, oh) > 3600) { const c = await blobToCanvas(blob, 3600); ow = c.width; oh = c.height; blob = await canvasToBlob(c, 'image/jpeg', 0.92); }
     const data = await OCR.recognize(blob, lang, (f, m) => busy.progress((i + f) / total, total > 1 ? `${m} · page ${i + 1} of ${total}` : m));
-    p.ocr = ocrResultToPage(data, p.pw, p.ph, lang);
+    p.ocr = ocrResultToPage(data, ow, oh, lang);
   }
   await saveDoc(doc);
 }
@@ -3619,7 +3676,12 @@ Object.assign(A, {
         Sess.open();
       }).catch(handleErr) },
       { icon: 'copy', label: 'Duplicate page', fn: async () => { const np = await copyPage(p); d.pages.splice(Viewer.idx + 1, 0, np); await saveDoc(d); Viewer.idx++; refreshViewer(); refreshView(); } },
-      { icon: 'image', label: 'Save as JPG', fn: async () => { const c = await renderPage(p, { maxDim: 3000 }); deliverFile(`${safeName(d.title)}-p${Viewer.idx + 1}.jpg`, await canvasToBlob(c, 'image/jpeg', 0.92)); } },
+      { icon: 'image', label: 'Save as JPG', desc: 'Full resolution', fn: async () => {
+        const name = `${safeName(d.title)}-p${Viewer.idx + 1}.jpg`;
+        if (!(p.marks && p.marks.length)) { deliverFile(name, await Store.getBlob(p.proc)); return; }
+        const c = await busy.run('Preparing…', () => renderPage(p));
+        deliverFile(name, await canvasToBlob(c, 'image/jpeg', 0.95));
+      } },
       { icon: 'x', label: 'Clear mark-up', disabled: !(p.marks && p.marks.length), fn: async () => { for (const m of p.marks) if (m.blob) await Store.delBlob(m.blob); p.marks = []; await refreshThumb(p); await saveDoc(d); refreshViewer(); refreshView(); } },
     ]);
   },
@@ -4161,7 +4223,13 @@ const EXPORT_FORMATS = [
 ];
 const PAGE_SIZES = { a4: [595.28, 841.89], letter: [612, 792], legal: [612, 1008] };
 const MARGINS = { none: 0, small: 17, wide: 42.5 };
-const QUAL = { small: { maxDim: 1500, jpeg: 0.62 }, standard: { maxDim: 2000, jpeg: 0.8 }, high: { maxDim: 2400, jpeg: 0.92 } };
+// Quality is chosen only here, at export. "Original" uses the saved scans as they are.
+const QUAL = {
+  original: { maxDim: 99999, jpeg: 0.95, keep: true, label: 'Original', desc: 'Full resolution, no extra compression', rel: 1 },
+  high: { maxDim: 3000, jpeg: 0.9, label: 'High', desc: 'Up to 3000 px, lightly compressed', rel: 0.62 },
+  medium: { maxDim: 2000, jpeg: 0.8, label: 'Medium', desc: 'Up to 2000 px, good for printing and sharing', rel: 0.48 },
+  small: { maxDim: 1400, jpeg: 0.65, label: 'Small', desc: 'Up to 1400 px, easy to email or send on chat apps', rel: 0.35 },
+};
 const WM_COLORS = ['#d0302a', '#14171a', '#2a44f0', '#808080'];
 
 let _dl = null;
@@ -4174,7 +4242,7 @@ async function deliverFile(name, blob) {
   if (dl) {
     try {
       await dl.save({ filename: name, data: blob });
-      toast(`Saved ${name}`, { type: 'ok' });
+      toast(`Saved ${name} · ${fmtBytes(blob.size)}`, { type: 'ok' });
       return true;
     } catch (e) {
       const code = e && e.code;
@@ -4189,14 +4257,14 @@ async function deliverFile(name, blob) {
   const a = document.createElement('a'); a.href = url; a.download = name; a.rel = 'noopener';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
-  toast(`Downloading ${name}`, { type: 'ok' });
+  toast(`Downloading ${name} · ${fmtBytes(blob.size)}`, { type: 'ok' });
   return true;
 }
 
 function openExport(doc, opts = {}) {
   const pages = opts.pageIds ? doc.pages.filter((p) => opts.pageIds.includes(p.id)) : doc.pages.slice();
   const st = {
-    fmt: opts.fmt || 'pdf', size: S.settings.pageSize, margin: S.settings.margin, quality: S.settings.quality,
+    fmt: opts.fmt || 'pdf', size: S.settings.pageSize, margin: S.settings.margin, quality: 'original',
     searchable: pages.every((p) => p.ocr && p.ocr.words && p.ocr.words.length), pw: !!opts.password, password: '', showPw: false,
     wm: !!opts.watermark, wmText: 'CONFIDENTIAL', wmMode: 'tile', wmOpacity: 0.18, wmColor: WM_COLORS[0],
     docxImages: true, name: safeName(doc.title) + (opts.pageIds ? ` (${pages.length} pp)` : ''),
@@ -4212,9 +4280,23 @@ function openExport(doc, opts = {}) {
   const body = s.body;
   const seg = (k, opts2) => `<div class="seg" data-k="${k}">${opts2.map(([v, l]) => `<button type="button" class="${String(st[k]) === String(v) ? 'on' : ''}" data-v="${esc(v)}">${esc(l)}</button>`).join('')}</div>`;
   const toggle = (k, title, small) => `<div class="toggle-row"><div class="grow"><b>${title}</b>${small ? `<small>${small}</small>` : ''}</div><label class="switch"><input type="checkbox" data-t="${k}" ${st[k] ? 'checked' : ''} aria-label="${esc(title)}"><span></span></label></div>`;
+  // Size estimates from the saved scans (exact for Original, approximate otherwise).
+  let savedBytes = 0, maxSide = 0;
+  Promise.all(pages.map((p) => Store.getBlob(p.proc))).then((bs) => {
+    savedBytes = bs.reduce((n, b) => n + (b ? b.size : 0), 0);
+    maxSide = Math.max(0, ...pages.map((p) => Math.max(p.pw || 0, p.ph || 0)));
+    const el = body.querySelector('#ex-qnote'); if (el) el.textContent = qualityNote();
+  });
+  function qualityNote() {
+    const Q = QUAL[st.quality];
+    if (!savedBytes) return Q.desc;
+    const side = Math.min(maxSide, Q.maxDim), scale = Math.min(1, Q.maxDim / Math.max(1, maxSide));
+    const est = Q.keep ? savedBytes : savedBytes * scale * scale * Q.rel;
+    return `${Q.desc}. Pages up to ${side} px · about ${fmtBytes(Math.round(est))} of images.`;
+  }
   function summary() {
     const n = pages.length;
-    return { pdf: `${n} ${n === 1 ? 'page' : 'pages'} → one PDF${st.pw ? ', password protected' : ''}`, jpg: n > 1 ? `${n} JPG images in one .zip` : 'One JPG image', png: n > 1 ? `${n} PNG images in one .zip` : 'One PNG image', docx: 'Word document with the recognised text' + (st.docxImages ? ' and page images' : ''), txt: 'Plain text from every page', long: `${n} ${n === 1 ? 'page' : 'pages'} stitched into one tall JPG` }[st.fmt];
+    return { pdf: `${n} ${n === 1 ? 'page' : 'pages'} → one PDF${st.pw ? ', password protected' : ''}`, jpg: n > 1 ? `${n} JPG images in one .zip` : 'One JPG image', png: n > 1 ? `${n} PNG images in one .zip` : 'One PNG image', docx: 'Word document with the recognised text' + (st.docxImages ? ' and page images' : ''), txt: 'Plain text from every page', long: `${n} ${n === 1 ? 'page' : 'pages'} stitched into one tall JPG (up to 2400 px wide)` }[st.fmt];
   }
   function draw() {
     const f = st.fmt, pdf = f === 'pdf', img = f === 'jpg' || f === 'png' || f === 'long';
@@ -4225,7 +4307,8 @@ function openExport(doc, opts = {}) {
       <label class="field"><span class="field-label">File name</span><input class="input" id="ex-name" value="${esc(st.name)}" autocomplete="off" maxlength="120"></label>
       ${pdf ? `<div class="opt-group"><span class="label">Page size</span>${seg('size', [['auto', 'Fit to image'], ['a4', 'A4'], ['letter', 'Letter'], ['legal', 'Legal']])}</div>
         <div class="opt-group"><span class="label">Margins</span>${seg('margin', [['none', 'None'], ['small', '6 mm'], ['wide', '15 mm']])}</div>` : ''}
-      ${pdf || img ? `<div class="opt-group"><span class="label">Quality</span>${seg('quality', [['small', 'Small file'], ['standard', 'Standard'], ['high', 'High']])}</div>` : ''}
+      ${pdf || img || f === 'docx' ? `<div class="opt-group"><span class="label">Quality</span>${seg('quality', Object.keys(QUAL).map((k) => [k, QUAL[k].label]))}
+        <p class="note" id="ex-qnote">${esc(qualityNote())}</p></div>` : ''}
       ${pdf ? toggle('searchable', 'Searchable text', 'Lets you select and search words in the PDF') : ''}
       ${pdf ? toggle('pw', 'Password protect', 'AES-256 encryption. Needed to open the file.') : ''}
       ${pdf && st.pw ? `<div class="sub"><label class="field"><span class="field-label">Password</span><div class="row"><input class="input grow" id="ex-pw" type="${st.showPw ? 'text' : 'password'}" value="${esc(st.password)}" autocomplete="new-password" placeholder="At least 4 characters"><button type="button" class="btn btn-sm" id="ex-show">${st.showPw ? 'Hide' : 'Show'}</button></div></label><p class="note">There is no way to recover a forgotten password. Note it somewhere safe.</p></div>` : ''}
@@ -4256,7 +4339,7 @@ function openExport(doc, opts = {}) {
 async function runExport(doc, pages, st) {
   const name = safeName(st.name || doc.title);
   const wm = st.wm ? { text: st.wmText.trim(), mode: st.wmMode, opacity: st.wmOpacity, color: st.wmColor } : null;
-  const Q = QUAL[st.quality] || QUAL.standard;
+  const Q = QUAL[st.quality] || QUAL.original;
   const needsText = st.fmt === 'docx' || st.fmt === 'txt' || (st.fmt === 'pdf' && st.searchable);
   busy.show('Preparing…');
   let blob, file;
@@ -4271,15 +4354,21 @@ async function runExport(doc, pages, st) {
       const type = st.fmt === 'png' ? 'image/png' : 'image/jpeg', files = [];
       for (let i = 0; i < pages.length; i++) {
         prog(i / pages.length, `Rendering page ${i + 1} of ${pages.length}…`);
-        const c = await renderPage(pages[i], { maxDim: Q.maxDim, watermark: wm });
-        files.push({ name: `${name}-${String(i + 1).padStart(2, '0')}.${st.fmt}`, data: await blobBytes(await canvasToBlob(c, type, Q.jpeg)) });
+        const pg = pages[i], fname = `${name}-${String(i + 1).padStart(2, '0')}.${st.fmt}`;
+        if (st.fmt === 'jpg' && Q.keep && !wm && !(pg.marks && pg.marks.length)) {
+          files.push({ name: fname, data: await blobBytes(await Store.getBlob(pg.proc)) });
+          continue;
+        }
+        const c = await renderPage(pg, { maxDim: Q.maxDim, watermark: wm });
+        files.push({ name: fname, data: await blobBytes(await canvasToBlob(c, type, Q.jpeg)) });
       }
       if (files.length === 1) { blob = new Blob([files[0].data], { type }); file = `${name}.${st.fmt}`; }
       else { blob = zipBuild(files); file = `${name}.zip`; }
     } else if (st.fmt === 'long') {
       const canv = [];
-      for (let i = 0; i < pages.length; i++) { prog(i / pages.length, `Rendering page ${i + 1} of ${pages.length}…`); canv.push(await renderPage(pages[i], { maxDim: Q.maxDim, watermark: wm })); }
-      let W = Math.min(1400, Math.max(...canv.map((c) => c.width)));
+      const longDim = Math.min(Q.maxDim, 2400);
+      for (let i = 0; i < pages.length; i++) { prog(i / pages.length, `Rendering page ${i + 1} of ${pages.length}…`); canv.push(await renderPage(pages[i], { maxDim: longDim, watermark: wm })); }
+      let W = Math.min(longDim, Math.max(...canv.map((c) => c.width)));
       const gap = 16;
       let H = canv.reduce((h, c) => h + Math.round(c.height * W / c.width), 0) + gap * (canv.length - 1);
       const lim = Math.min(1, 30000 / H, Math.sqrt(16e6 / (W * H)));
@@ -4297,7 +4386,10 @@ async function runExport(doc, pages, st) {
       for (let i = 0; i < pages.length; i++) {
         prog(i / pages.length, `Adding page ${i + 1} of ${pages.length}…`);
         const p = pages[i], sec = { heading: pages.length > 1 ? `Page ${doc.pages.indexOf(p) + 1}` : '', text: (p.ocr && p.ocr.text) || '' };
-        if (st.docxImages) { const c = await renderPage(p, { maxDim: 1600 }); sec.image = { data: await blobBytes(await canvasToBlob(c, 'image/jpeg', 0.82)), pxW: c.width, pxH: c.height }; }
+        if (st.docxImages) {
+          if (Q.keep && !(p.marks && p.marks.length) && p.pw) sec.image = { data: await blobBytes(await Store.getBlob(p.proc)), pxW: p.pw, pxH: p.ph };
+          else { const c = await renderPage(p, { maxDim: Q.maxDim }); sec.image = { data: await blobBytes(await canvasToBlob(c, 'image/jpeg', Q.jpeg)), pxW: c.width, pxH: c.height }; }
+        }
         sections.push(sec);
       }
       blob = docxBuild(sections, doc.title); file = name + '.docx';
@@ -4317,7 +4409,7 @@ async function buildPdfExport(doc, pages, st, Q, wm, prog) {
       const z = await deflateBytes(await IP.run('pack1', { img: getImageData(c) }));
       if (z) image = { kind: 'bw1', data: z, pxW: c.width, pxH: c.height };
     }
-    if (!image && plain && st.quality === 'high' && p.pw && p.ph) {
+    if (!image && plain && Q.keep && p.pw && p.ph) {
       image = { kind: 'jpeg', data: await blobBytes(await Store.getBlob(p.proc)), pxW: p.pw, pxH: p.ph };
     }
     if (!image) {
