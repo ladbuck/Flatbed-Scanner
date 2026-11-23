@@ -347,10 +347,10 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .adj { display: grid; grid-template-columns: auto 1fr auto; gap: 6px 10px; align-items: center; padding: 4px max(18px, var(--safe-l)) 2px; font-size: 12px; color: #aab0b7; }
 .adj .ic { width: 18px; height: 18px; }
 .adj output { font-family: var(--font-mono); width: 34px; text-align: right; }
-.ov-view { flex: 1; min-height: 0; overflow: auto; display: grid; place-items: center; padding: 12px; touch-action: pan-x pan-y pinch-zoom; }
-.ov-view canvas { max-width: 100%; max-height: 100%; box-shadow: 0 4px 24px rgba(0, 0, 0, .5); background: #fff; }
-.ov-view.zoom { place-items: start; }
-.ov-view.zoom canvas { max-width: none; max-height: none; width: 200%; }
+.ov-view { position: absolute; inset: 0; overflow: auto; display: grid; place-items: center; padding: 12px; touch-action: pan-x pan-y pinch-zoom; }
+.ov-view img { display: block; max-width: 100%; max-height: calc(100% - 0px); width: auto; height: auto; object-fit: contain; box-shadow: 0 4px 24px rgba(0, 0, 0, .5); background: #fff; image-rendering: auto; }
+.ov-view.zoom { place-items: start; padding: 0; }
+.ov-view.zoom img { max-width: none; max-height: none; height: auto; }
 .navbtn { position: absolute; top: 50%; transform: translateY(-50%); width: 44px; height: 44px; border-radius: 50%; background: rgba(0, 0, 0, .55); color: #fff; display: grid; place-items: center; z-index: 2; }
 .navbtn.l { left: 10px; } .navbtn.r { right: 10px; }
 .mk-props { display: flex; align-items: center; gap: 10px; padding: 6px max(14px, var(--safe-l)); min-height: 52px; flex-wrap: wrap; justify-content: center; }
